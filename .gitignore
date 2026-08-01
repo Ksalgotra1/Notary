@@ -1,0 +1,30 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Docs — internal planning only, not for public repo
+docs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# SQLite cache (disposable — B2 is source of truth)
+*.sqlite
+*.sqlite-journal
+
+# Node
+node_modules/
+dist/
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Spike/scratch scripts
+backend/spike_*.py
