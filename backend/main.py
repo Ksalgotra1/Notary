@@ -35,11 +35,13 @@ app.include_router(router)
 
 @app.get("/health")
 async def health():
-    """Per-key status across the Google key pool (FR-13 preview)."""
+    """Health & provider status endpoint."""
     import os
-    keys = [k for k in os.getenv("GOOGLE_API_KEYS", "").split(",") if k]
+    keys = [k for k in os.getenv("GOOGLE_API_KEYS", "").split(",") if k.strip()]
     return {
         "status": "ok",
-        "keys_configured": len(keys),
+        "google_keys_configured": len(keys),
+        "github_pat_configured": bool(os.getenv("GITHUB_PAT")),
         "b2_bucket": os.getenv("B2_BUCKET_NAME", "not set"),
+        "b2_region": os.getenv("B2_REGION", "us-east-005"),
     }
