@@ -2,7 +2,7 @@
 
 **Tamper-evident provenance for AI-generated media**
 
-Backblaze Generative Media Hackathon · Team: Krishna + 1 · Deadline: Aug 3, 2026
+Backblaze Generative Media Hackathon · Team: Krishna Salgotra, Rishabh Dutt · Deadline: Aug 3, 2026
 
 ---
 
