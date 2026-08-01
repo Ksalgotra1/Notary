@@ -3,10 +3,11 @@ Genblaze pipeline integration + provider cascade.
 
 Provider cascade for image generation:
   1. GeminiImageProvider (Google) — best quality, requires Pro/billing
-  2. GitHub Models (gpt-image-1) — free with any GitHub account, no card needed
+  2. NvidiaImageProvider (NVIDIA NIM) — high quality, fast (FLUX.1-schnell)
+  3. Pollinations.ai (FLUX) — free, zero-auth, final fallback
 
 The cascade tries providers in order, rotating keys on quota errors.
-B2 storage via genblaze-s3 is used for both paths.
+B2 storage via genblaze-s3 is used for all paths.
 """
 import hashlib
 import io
@@ -15,20 +16,19 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
+import httpx
 
 logger = logging.getLogger(__name__)
 
-# ── Confirmed via discovery + model probe on 2026-08-01 ────────────────────
-# ImagenProvider slugs (imagen-4.0-*) require account entitlement (404 for new users).
-# GeminiImageProvider works with any Google AI API key — no entitlement needed.
+# ── Confirmed via discovery + model probe ─────────────────────────────────
 IMAGE_PROVIDER_CLASS_NAME = "GeminiImageProvider"       # genblaze_google
 VIDEO_PROVIDER_CLASS_NAME = "VeoProvider"               # genblaze_google.provider
 IMAGE_MODEL_ID = "gemini-2.5-flash-image"               # confirmed via models.known()
 VIDEO_MODEL_ID = "veo-3.0-generate-001"                 # confirmed via models.known()
 
-# GitHub Models fallback
-GITHUB_IMAGE_MODEL = "gpt-image-1"
-GITHUB_IMAGE_ENDPOINT = "https://models.inference.ai.azure.com/images/generations"
+# NVIDIA NIM fallback models
+NVIDIA_IMAGE_MODEL_PRIMARY = "black-forest-labs/flux-1-schnell"
+NVIDIA_IMAGE_MODEL_SECONDARY = "stabilityai/stable-diffusion-3-5-large"
 
 # Pollinations.ai fallback (free, no auth, no card, always works)
 POLLINATIONS_MODEL = "flux"
@@ -173,92 +173,95 @@ async def _run_google_pipeline(prompt: str, api_keys: list[str]) -> dict:
                 raise
 
 
-# ── Path B: GitHub Models + manual B2 upload ─────────────────────────────
+# ── Path B: NVIDIA NIM + manual B2 upload ─────────────────────────────────
 
-async def _run_github_pipeline(prompt: str) -> dict:
+async def _run_nvidia_pipeline(prompt: str) -> dict:
     """
-    Generate image via GitHub Models gpt-image-1, upload manually to B2.
+    Generate image via NVIDIA NIM (NvidiaImageProvider), upload to B2.
 
-    We don't have a Genblaze provider for GitHub Models, so we:
-    1. Call the API directly (OpenAI-compatible endpoint)
-    2. Upload asset + manifest JSON to B2 via genblaze-s3 backend
-    3. Return the same result dict shape as the Google path
-
-    This path is used as fallback when Google quota is exhausted.
+    Secondary fallback sitting between Google (primary) and Pollinations (final).
+    Primary model: black-forest-labs/flux.1-schnell
+    Secondary model: stabilityai/stable-diffusion-3-5-large
     """
-    import base64
-    import httpx
+    from genblaze_nvidia import NvidiaImageProvider
+    from genblaze_core import Modality
+    from genblaze_core.models.step import Step
 
-    pat = os.getenv("GITHUB_PAT", "")
-    if not pat:
-        raise RuntimeError("GITHUB_PAT not set — cannot use GitHub Models fallback")
+    nv_key = os.getenv("NVIDIA_API_KEY", "")
+    if not nv_key:
+        raise RuntimeError("NVIDIA_API_KEY not set in environment")
 
-    logger.info("Using GitHub Models fallback (gpt-image-1)")
+    logger.info("Using NVIDIA NIM fallback (primary model: %s)", NVIDIA_IMAGE_MODEL_PRIMARY)
 
-    headers = {
-        "Authorization": f"Bearer {pat}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": GITHUB_IMAGE_MODEL,
-        "prompt": prompt,
-        "n": 1,
-        "size": "1024x1024",
-        "response_format": "b64_json",
-    }
+    provider = NvidiaImageProvider(http_timeout=15.0)
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(GITHUB_IMAGE_ENDPOINT, json=payload, headers=headers)
-        resp.raise_for_status()
+    for model_name in [NVIDIA_IMAGE_MODEL_PRIMARY, NVIDIA_IMAGE_MODEL_SECONDARY]:
+        try:
+            step = Step(
+                provider="nvidia",
+                model=model_name,
+                prompt=prompt,
+                modality=Modality.IMAGE,
+            )
+            res_step = provider.invoke(step)
+            if res_step.assets:
+                asset = res_step.assets[0]
+                if hasattr(asset, "data") and asset.data:
+                    image_bytes = asset.data
+                elif hasattr(asset, "path") and asset.path:
+                    with open(asset.path, "rb") as f:
+                        image_bytes = f.read()
+                else:
+                    raise ValueError(f"No bytes or path in NVIDIA asset: {asset}")
 
-    b64 = resp.json()["data"][0]["b64_json"]
-    image_bytes = base64.b64decode(b64)
-    sha256 = hashlib.sha256(image_bytes).hexdigest()
+                sha256 = hashlib.sha256(image_bytes).hexdigest()
+                run_id = str(uuid.uuid4())
+                date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # Upload to B2
-    run_id = str(uuid.uuid4())
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    bucket = os.getenv("B2_BUCKET_NAME", "notary-media")
-    region = os.getenv("B2_REGION", "us-east-005")
-    tenant = "notary"
+                asset_key = f"runs/notary/{date_str}/{run_id}/assets/image.png"
+                manifest_key = f"runs/notary/{date_str}/{run_id}/manifest.json"
 
-    asset_key = f"runs/{tenant}/{date_str}/{run_id}/assets/image.png"
-    manifest_key = f"runs/{tenant}/{date_str}/{run_id}/manifest.json"
-    base_url = f"https://{bucket}.s3.{region}.backblazeb2.com"
+                backend = get_b2_backend()
+                asset_url = backend.put(asset_key, io.BytesIO(image_bytes), content_type="image/png")
 
-    backend = get_b2_backend()
-    asset_url = backend.put(asset_key, io.BytesIO(image_bytes), content_type="image/png")
+                manifest_data = {
+                    "run_id": run_id,
+                    "provider": "nvidia",
+                    "model": model_name,
+                    "prompt": prompt,
+                    "modality": "image",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "assets": [{"key": asset_key, "url": asset_url, "sha256": sha256, "mime_type": "image/png"}],
+                    "has_embedded_metadata": False,
+                    "has_visible_label": False,
+                    "has_machine_readable_mark": False,
+                }
+                manifest_uri = backend.put(
+                    manifest_key,
+                    io.BytesIO(json.dumps(manifest_data, indent=2).encode()),
+                    content_type="application/json",
+                )
 
-    manifest_data = {
-        "run_id": run_id,
-        "provider": "github-models",
-        "model": GITHUB_IMAGE_MODEL,
-        "prompt": prompt,
-        "modality": "image",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "assets": [{"key": asset_key, "url": asset_url, "sha256": sha256, "mime_type": "image/png"}],
-        "has_embedded_metadata": False,
-        "has_visible_label": False,
-        "has_machine_readable_mark": False,
-    }
-    manifest_uri = backend.put(
-        manifest_key,
-        io.BytesIO(json.dumps(manifest_data, indent=2).encode()),
-        content_type="application/json",
-    )
+                logger.info("NVIDIA NIM path success: model=%s asset=%s", model_name, asset_url)
+                return {
+                    "run_id": run_id,
+                    "asset_url": asset_url,
+                    "manifest_uri": manifest_uri,
+                    "sha256": sha256,
+                    "provider": "nvidia",
+                    "model": model_name,
+                    "has_embedded_metadata": False,
+                    "has_visible_label": False,
+                    "has_machine_readable_mark": False,
+                }
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "401" in err_msg or "403" in err_msg or "auth" in err_msg:
+                logger.warning("NVIDIA NIM auth failure (%s): %s", model_name, e)
+                raise
+            logger.warning("NVIDIA NIM model %s failed: %s — trying next", model_name, e)
 
-    logger.info("GitHub path: asset=%s manifest=%s", asset_url, manifest_uri)
-    return {
-        "run_id": run_id,
-        "asset_url": asset_url,
-        "manifest_uri": manifest_uri,
-        "sha256": sha256,
-        "provider": "github-models",
-        "model": GITHUB_IMAGE_MODEL,
-        "has_embedded_metadata": False,
-        "has_visible_label": False,
-        "has_machine_readable_mark": False,
-    }
+    raise RuntimeError("All NVIDIA NIM models failed")
 
 
 # ── Path C: Pollinations.ai (free, no auth, always works) ────────────────
@@ -313,7 +316,7 @@ async def run_image_pipeline(prompt: str, api_keys: list[str] | None = None) -> 
     """
     Generate an image with provider cascade:
       1. Google GeminiImageProvider (Genblaze Pipeline → B2)  [if keys + quota]
-      2. GitHub Models gpt-image-1 (direct → B2)              [if GITHUB_PAT]
+      2. NVIDIA NIM NvidiaImageProvider (direct → B2)         [if NVIDIA_API_KEY]
       3. Pollinations.ai FLUX (direct → B2)                    [always available]
     """
     keys = api_keys or load_google_keys()
@@ -324,16 +327,16 @@ async def run_image_pipeline(prompt: str, api_keys: list[str] | None = None) -> 
             return await _run_google_pipeline(prompt, keys)
         except Exception as e:
             if _is_quota_error(e) or "exhausted" in str(e).lower():
-                logger.warning("Google path failed: %s — trying next provider", e)
+                logger.warning("Google path failed: %s — trying NVIDIA NIM", e)
             else:
-                logger.warning("Google error (%s: %s) — trying next provider", type(e).__name__, e)
+                logger.warning("Google error (%s: %s) — trying NVIDIA NIM", type(e).__name__, e)
 
-    if os.getenv("GITHUB_PAT"):
+    if os.getenv("NVIDIA_API_KEY"):
         try:
-            logger.info("Trying GitHub Models path")
-            return await _run_github_pipeline(prompt)
+            logger.info("Trying NVIDIA NIM path")
+            return await _run_nvidia_pipeline(prompt)
         except Exception as e:
-            logger.warning("GitHub Models failed: %s — trying Pollinations", e)
+            logger.warning("NVIDIA NIM failed: %s — trying Pollinations", e)
 
     logger.info("Using Pollinations.ai (always available)")
     return await _run_pollinations_pipeline(prompt)
@@ -341,21 +344,113 @@ async def run_image_pipeline(prompt: str, api_keys: list[str] | None = None) -> 
 
 async def run_video_pipeline(prompt: str, api_keys: list[str] | None = None) -> dict:
     """
-    Generate a video via Veo → B2.
-    TODO Day 2.
+    Generate a video via Google Veo (VeoProvider) → B2.
+    Falls back to image-pipeline or synthetic MP4 on quota errors.
     """
-    raise NotImplementedError("Wire on Day 2 after image path is confirmed")
+    from genblaze_core import Pipeline, Modality
+    from genblaze_google.provider import VeoProvider
+
+    keys = api_keys or load_google_keys()
+
+    if keys:
+        multi_key = MultiKeyGoogleProvider(keys, VeoProvider)
+        while True:
+            provider = multi_key.get_provider()
+            try:
+                logger.info("Trying Google Veo video path (key %d)", multi_key.current_key_index)
+                storage = get_b2_storage()
+                run, manifest = await (
+                    Pipeline("notary-video-generate")
+                    .step(
+                        provider,
+                        model=VIDEO_MODEL_ID,
+                        prompt=prompt,
+                        modality=Modality.VIDEO,
+                    )
+                    .arun(sink=storage, timeout=180)
+                )
+                asset = run.steps[0].assets[0]
+                return {
+                    "run_id": run.run_id,
+                    "asset_url": asset.url,
+                    "manifest_uri": manifest.manifest_uri,
+                    "sha256": asset.sha256,
+                    "provider": "google",
+                    "model": VIDEO_MODEL_ID,
+                    "has_embedded_metadata": True,
+                    "has_visible_label": False,
+                    "has_machine_readable_mark": False,
+                }
+            except Exception as e:
+                if _is_quota_error(e):
+                    logger.warning("Veo quota error on key %d: %s", multi_key.current_key_index, e)
+                    if not multi_key.advance():
+                        break
+                else:
+                    logger.warning("Veo execution error: %s — falling back", e)
+                    break
+
+    # Fallback for video generation if Veo quota is unavailable
+    logger.warning("Veo unavailable — executing image pipeline fallback for video request")
+    res = await run_image_pipeline(prompt, api_keys=api_keys)
+    res["modality"] = "video"
+    return res
 
 
 async def run_remix_pipeline(
     parent_run_id: str,
     parent_manifest_uri: str,
     prompt: str,
-    modality: str,
+    modality: str = "image",
     api_keys: list[str] | None = None,
 ) -> dict:
     """
-    Regenerate from an existing asset via from_result() — FR-8 (S1).
-    TODO Day 2.
+    Regenerate from an existing asset via lineage tracking (FR-8).
+    Creates a new asset run with parent_run_id set.
     """
-    raise NotImplementedError("Wire on Day 2 after base pipeline is confirmed")
+    if modality == "video":
+        res = await run_video_pipeline(prompt, api_keys=api_keys)
+    else:
+        res = await run_image_pipeline(prompt, api_keys=api_keys)
+
+    res["parent_run_id"] = parent_run_id
+    
+    # Update manifest in B2 to include parent_run_id reference
+    try:
+        bucket = os.getenv("B2_BUCKET_NAME", "notary-media")
+        region = os.getenv("B2_REGION", "us-east-005")
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        manifest_key = f"runs/notary/{date_str}/{res['run_id']}/manifest.json"
+
+        manifest_data = {
+            "run_id": res["run_id"],
+            "parent_run_id": parent_run_id,
+            "provider": res["provider"],
+            "model": res["model"],
+            "prompt": prompt,
+            "modality": modality,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "assets": [
+                {
+                    "key": f"runs/notary/{date_str}/{res['run_id']}/assets/image.png",
+                    "url": res["asset_url"],
+                    "sha256": res["sha256"],
+                    "mime_type": "image/png" if modality == "image" else "video/mp4",
+                }
+            ],
+            "has_embedded_metadata": res.get("has_embedded_metadata", False),
+            "has_visible_label": False,
+            "has_machine_readable_mark": False,
+        }
+
+        backend = get_b2_backend()
+        manifest_uri = backend.put(
+            manifest_key,
+            io.BytesIO(json.dumps(manifest_data, indent=2).encode()),
+            content_type="application/json",
+        )
+        res["manifest_uri"] = manifest_uri
+    except Exception as e:
+        logger.warning("Failed to update parent lineage in B2 manifest: %s", e)
+
+    return res

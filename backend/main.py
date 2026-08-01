@@ -41,7 +41,7 @@ async def health():
     return {
         "status": "ok",
         "google_keys_configured": len(keys),
-        "github_pat_configured": bool(os.getenv("GITHUB_PAT")),
-        "b2_bucket": os.getenv("B2_BUCKET_NAME", "not set"),
+        "nvidia_key_configured": bool(os.getenv("NVIDIA_API_KEY")),
+        "b2_bucket": os.getenv("B2_BUCKET_NAME", "notary-media"),
         "b2_region": os.getenv("B2_REGION", "us-east-005"),
     }

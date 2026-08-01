@@ -116,7 +116,10 @@ async def analyze_tampering(
             resp.raise_for_status()
             data = resp.json()
 
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
         analysis = json.loads(raw_text)
 
         return {
