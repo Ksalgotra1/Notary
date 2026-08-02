@@ -1,17 +1,11 @@
-"""
-API routes — all endpoints for the Notary backend.
-
-Day 1: stubs with mock data so Person B can build the frontend.
-Day 2: replace all "# TODO Day 2" blocks with real logic.
-"""
+"""API routes for the Notary backend."""
 import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Optional
-import uuid
+from urllib.parse import unquote, urlparse
 
-import httpx
-from fastapi import APIRouter, HTTPException, Query, Depends
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from aiosqlite import Connection
 
 from cache import get_db, get_asset, list_assets, insert_asset, update_verify_status, update_compliance
@@ -25,7 +19,7 @@ from models import (
     RemixRequest,
     VerifyResponse,
 )
-from pipeline import run_image_pipeline, run_video_pipeline, run_remix_pipeline, get_b2_backend
+from pipeline import run_image_pipeline, run_video_pipeline, run_remix_pipeline, get_storage_backend
 from forensics import analyze_tampering
 from rebuild_cache import main as run_rebuild_cache
 
@@ -33,44 +27,41 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ── Mock helpers (Day 1 only — removed on Day 2) ─────────────────
+def _asset_key_from_url(asset_url: str) -> str:
+    path = unquote(urlparse(asset_url).path)
+    if "/file/" in path:
+        parts = path.split("/file/", 1)[1].split("/", 1)
+        if len(parts) == 2:
+            return parts[1]
 
-def _mock_run_id() -> str:
-    return str(uuid.uuid4())
-
-
-def _mock_asset_row(prompt: str, modality: str, run_id: str | None = None,
-                    parent_run_id: str | None = None) -> dict:
-    rid = run_id or _mock_run_id()
-    return {
-        "run_id": rid,
-        "parent_run_id": parent_run_id,
-        "provider": "google",
-        "model": "imagen-3.0-generate-002",
-        "modality": modality,
-        "prompt": prompt,
-        "b2_asset_url": f"https://f005.backblazeb2.com/file/notary-media/runs/demo/2026-08-01/{rid}/asset.png",
-        "b2_manifest_url": f"https://f005.backblazeb2.com/file/notary-media/runs/demo/2026-08-01/{rid}/manifest.json",
-        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "last_verified_at": None,
-        "verify_status": None,
-        "params": {"width": 1024, "height": 1024},
-        "timestamps": {"queued": datetime.now(timezone.utc).isoformat()},
-        # Compliance defaults — most are False until embed is done
-        "has_embedded_metadata": 0,
-        "has_visible_label": 0,
-        "has_machine_readable_mark": 0,
-        "has_audio_disclosure": 0,
-        "compliance_evaluated_at": None,
-        "india_compliant": None,
-        "eu_compliant": None,
-    }
+    key_index = asset_url.find("runs/")
+    if key_index != -1:
+        return asset_url[key_index:]
+    raise ValueError(f"Cannot derive B2 object key from URL: {asset_url}")
 
 
-# ── Core generation endpoints ─────────────────────────────────────
+async def _read_b2_asset_bytes(row: dict) -> bytes:
+    data = get_storage_backend().get(_asset_key_from_url(row["b2_asset_url"]))
+    if isinstance(data, bytes):
+        return data
+    if hasattr(data, "read"):
+        value = data.read()
+        return await value if hasattr(value, "__await__") else value
+    return bytes(data)
 
-# ── Core generation endpoints ─────────────────────────────────────
+
+async def _forensic_detail(row: dict, submitted_bytes: bytes) -> ForensicDetail | None:
+    try:
+        analysis = await analyze_tampering(
+            original_bytes=await _read_b2_asset_bytes(row),
+            tampered_bytes=submitted_bytes,
+            modality=row.get("modality", "image"),
+        )
+        return ForensicDetail(**analysis) if analysis else None
+    except Exception as e:
+        logger.warning("Forensic analysis failed: %s", e)
+        return None
+
 
 @router.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest, db: Connection = Depends(get_db)):
@@ -149,11 +140,7 @@ async def verify_asset(run_id: str, db: Connection = Depends(get_db)):
     manifest_hash = row["sha256"]
 
     try:
-        backend = get_b2_backend()
-        asset_url = row["b2_asset_url"]
-        key_index = asset_url.find("runs/")
-        asset_key = asset_url[key_index:] if key_index != -1 else f"runs/notary/{run_id}/assets/image.png"
-        original_bytes = backend.get(asset_key)
+        original_bytes = await _read_b2_asset_bytes(row)
         computed_hash = hashlib.sha256(original_bytes).hexdigest()
     except Exception as e:
         logger.warning("Failed to fetch asset from B2: %s", e)
@@ -163,16 +150,7 @@ async def verify_asset(run_id: str, db: Connection = Depends(get_db)):
 
     forensic = None
     if not match:
-        try:
-            analysis = await analyze_tampering(
-                original_bytes=original_bytes,
-                tampered_bytes=b"tampered_copy_placeholder",
-                modality=row.get("modality", "image"),
-            )
-            if analysis:
-                forensic = ForensicDetail(**analysis)
-        except Exception as e:
-            logger.warning("Forensic analysis failed: %s", e)
+        forensic = await _forensic_detail(row, b"server-side-verification-mismatch")
 
     verified_at = datetime.now(timezone.utc).isoformat()
     status_str = "pass" if match else "fail"
@@ -304,22 +282,7 @@ async def public_verify(
 
     forensic = None
     if not is_match:
-        try:
-            backend = get_b2_backend()
-            asset_url = row["b2_asset_url"]
-            key_index = asset_url.find("runs/")
-            asset_key = asset_url[key_index:] if key_index != -1 else f"runs/notary/{run_id}/assets/image.png"
-            original_bytes = backend.get(asset_key)
-
-            analysis = await analyze_tampering(
-                original_bytes=original_bytes,
-                tampered_bytes=b"tampered_user_copy_placeholder",
-                modality=row.get("modality", "image"),
-            )
-            if analysis:
-                forensic = ForensicDetail(**analysis)
-        except Exception as e:
-            logger.warning("Public forensic analysis failed: %s", e)
+        forensic = await _forensic_detail(row, b"public-hash-mismatch")
 
     verified_at = datetime.now(timezone.utc).isoformat()
     return VerifyResponse(
@@ -327,6 +290,36 @@ async def public_verify(
         computed_hash=req.file_hash,
         manifest_hash=manifest_hash,
         verified_at=verified_at,
+        forensic_analysis=forensic,
+    )
+
+
+@router.post("/public/verify/{run_id}/file", response_model=VerifyResponse)
+async def public_verify_file(
+    run_id: str,
+    file_hash: str = Form(...),
+    file: UploadFile = File(...),
+    db: Connection = Depends(get_db),
+):
+    """Verify a public upload and run forensic analysis with actual submitted bytes."""
+    row = await get_asset(db, run_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    submitted_bytes = await file.read()
+    computed_hash = hashlib.sha256(submitted_bytes).hexdigest()
+    if computed_hash.lower() != file_hash.lower():
+        raise HTTPException(status_code=400, detail="Submitted hash does not match uploaded file")
+
+    manifest_hash = row["sha256"]
+    is_match = computed_hash.lower() == manifest_hash.lower()
+    forensic = None if is_match else await _forensic_detail(row, submitted_bytes)
+
+    return VerifyResponse(
+        match=is_match,
+        computed_hash=computed_hash,
+        manifest_hash=manifest_hash,
+        verified_at=datetime.now(timezone.utc).isoformat(),
         forensic_analysis=forensic,
     )
 

@@ -16,6 +16,7 @@ venv/
 # SQLite cache (disposable — B2 is source of truth)
 *.sqlite
 *.sqlite-journal
+backend/generated/
 
 # Node
 node_modules/

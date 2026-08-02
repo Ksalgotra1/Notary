@@ -52,9 +52,10 @@ export default function PublicVerifyPage() {
 
     try {
       const fileHash = await computeSHA256(file);
-      const res = await api.post(`/public/verify/${runId}`, {
-        file_hash: fileHash,
-      });
+      const formData = new FormData();
+      formData.append('file_hash', fileHash);
+      formData.append('file', file);
+      const res = await api.post(`/public/verify/${runId}/file`, formData);
       setVerifyResult(res.data);
     } catch (err) {
       console.error(err);
@@ -230,7 +231,7 @@ export default function PublicVerifyPage() {
                   )}
                 </div>
                 <div className="drop-zone-hint">
-                  Client-side SHA-256 hashing — file is never uploaded
+                  Hash is computed in-browser; file bytes are sent only for forensic mismatch analysis
                 </div>
               </div>
 

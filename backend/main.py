@@ -5,8 +5,12 @@ All provider credentials stay server-side (NFR-7).
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
 
+load_dotenv()
 from cache import init_db
+from pipeline import LOCAL_GENERATED_DIR
 from routes import router
 
 
@@ -29,6 +33,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+LOCAL_GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/generated", StaticFiles(directory=LOCAL_GENERATED_DIR), name="generated")
 
 app.include_router(router)
 

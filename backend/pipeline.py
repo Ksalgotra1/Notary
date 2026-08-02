@@ -16,13 +16,14 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 import httpx
 
 logger = logging.getLogger(__name__)
 
 # ── Confirmed via discovery + model probe ─────────────────────────────────
 IMAGE_PROVIDER_CLASS_NAME = "GeminiImageProvider"       # genblaze_google
-VIDEO_PROVIDER_CLASS_NAME = "VeoProvider"               # genblaze_google.provider
+VIDEO_PROVIDER_CLASS_NAME = "VeoProvider"               # genblaze_google
 IMAGE_MODEL_ID = "gemini-2.5-flash-image"               # confirmed via models.known()
 VIDEO_MODEL_ID = "veo-3.0-generate-001"                 # confirmed via models.known()
 
@@ -33,6 +34,7 @@ NVIDIA_IMAGE_MODEL_SECONDARY = "stabilityai/stable-diffusion-3-5-large"
 # Pollinations.ai fallback (free, no auth, no card, always works)
 POLLINATIONS_MODEL = "flux"
 POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
+LOCAL_GENERATED_DIR = Path(__file__).resolve().parent / "generated"
 
 
 class MultiKeyGoogleProvider:
@@ -89,26 +91,57 @@ def get_b2_storage():
     """Build an ObjectStorageSink pointing at the notary-media B2 bucket."""
     from genblaze_core import ObjectStorageSink, KeyStrategy
     from genblaze_s3 import S3StorageBackend
+    # NOTE: for_backblaze takes bucket as first positional arg, rest as kwargs
+    backend = S3StorageBackend.for_backblaze(
+        os.getenv("B2_BUCKET_NAME", "notary-media"),
+        region=os.getenv("B2_REGION", "us-east-005"),
+        key_id=os.getenv("B2_KEY_ID"),
+        app_key=os.getenv("B2_APP_KEY"),
+    )
     return ObjectStorageSink(
-        S3StorageBackend.for_backblaze(
-            bucket=os.getenv("B2_BUCKET_NAME", "notary-media"),
-            region=os.getenv("B2_REGION", "us-east-005"),
-            key_id=os.getenv("B2_KEY_ID"),
-            app_key=os.getenv("B2_APP_KEY"),
-        ),
+        backend,
         key_strategy=KeyStrategy.HIERARCHICAL,
     )
 
 
 def get_b2_backend():
-    """Return the raw S3StorageBackend for manual uploads (GitHub path)."""
+    """Return the raw S3StorageBackend for manual uploads."""
     from genblaze_s3 import S3StorageBackend
     return S3StorageBackend.for_backblaze(
-        bucket=os.getenv("B2_BUCKET_NAME", "notary-media"),
+        os.getenv("B2_BUCKET_NAME", "notary-media"),
         region=os.getenv("B2_REGION", "us-east-005"),
         key_id=os.getenv("B2_KEY_ID"),
         app_key=os.getenv("B2_APP_KEY"),
     )
+
+
+class LocalStorageBackend:
+    """Local dev storage used when B2/genblaze-s3 is not configured."""
+
+    def put(self, key: str, body, content_type: str | None = None) -> str:
+        path = LOCAL_GENERATED_DIR / key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = body.read() if hasattr(body, "read") else body
+        path.write_bytes(data)
+        return f"http://localhost:8000/generated/{key.replace(os.sep, '/')}"
+
+    def get(self, key: str) -> bytes:
+        return (LOCAL_GENERATED_DIR / key).read_bytes()
+
+
+def get_storage_backend():
+    """
+    Prefer B2; fall back to local files so the site remains testable.
+    Catches: missing module, missing/wrong credentials, bucket not found.
+    """
+    try:
+        backend = get_b2_backend()
+        logger.info("B2 storage backend connected (bucket=%s)", os.getenv("B2_BUCKET_NAME"))
+        return backend
+    except Exception as e:
+        logger.warning("B2 backend unavailable (%s: %s); using local generated storage",
+                       type(e).__name__, e)
+        return LocalStorageBackend()
 
 
 def _is_quota_error(e: Exception) -> bool:
@@ -126,10 +159,6 @@ async def _run_google_pipeline(prompt: str, api_keys: list[str]) -> dict:
     """
     Generate image via GeminiImageProvider → Genblaze Pipeline → B2.
     Rotates across keys on quota errors.
-
-    Returns the standard result dict on success.
-    Raises RuntimeError if all keys are exhausted.
-    Raises the original exception for non-quota errors.
     """
     from genblaze_core import Pipeline, Modality
     from genblaze_google import GeminiImageProvider
@@ -151,7 +180,14 @@ async def _run_google_pipeline(prompt: str, api_keys: list[str]) -> dict:
                 )
                 .arun(sink=storage, timeout=120)
             )
-            asset = run.steps[0].assets[0]
+            steps = getattr(run, "steps", [])
+            assets = getattr(steps[0], "assets", []) if steps else []
+            if not assets:
+                status = getattr(run, "status", "failed")
+                raise RuntimeError(
+                    f"Google image pipeline returned no asset (status={status})"
+                )
+            asset = assets[0]
             return {
                 "run_id": run.run_id,
                 "asset_url": asset.url,
@@ -178,10 +214,7 @@ async def _run_google_pipeline(prompt: str, api_keys: list[str]) -> dict:
 async def _run_nvidia_pipeline(prompt: str) -> dict:
     """
     Generate image via NVIDIA NIM (NvidiaImageProvider), upload to B2.
-
     Secondary fallback sitting between Google (primary) and Pollinations (final).
-    Primary model: black-forest-labs/flux.1-schnell
-    Secondary model: stabilityai/stable-diffusion-3-5-large
     """
     from genblaze_nvidia import NvidiaImageProvider
     from genblaze_core import Modality
@@ -221,7 +254,7 @@ async def _run_nvidia_pipeline(prompt: str) -> dict:
                 asset_key = f"runs/notary/{date_str}/{run_id}/assets/image.png"
                 manifest_key = f"runs/notary/{date_str}/{run_id}/manifest.json"
 
-                backend = get_b2_backend()
+                backend = get_storage_backend()
                 asset_url = backend.put(asset_key, io.BytesIO(image_bytes), content_type="image/png")
 
                 manifest_data = {
@@ -288,7 +321,7 @@ async def _run_pollinations_pipeline(prompt: str) -> dict:
     asset_key = f"runs/notary/{date_str}/{run_id}/assets/image.{ext}"
     manifest_key = f"runs/notary/{date_str}/{run_id}/manifest.json"
 
-    backend = get_b2_backend()
+    backend = get_storage_backend()
     asset_url = backend.put(asset_key, io.BytesIO(image_bytes), content_type=content_type)
 
     manifest_data = {
@@ -348,7 +381,7 @@ async def run_video_pipeline(prompt: str, api_keys: list[str] | None = None) -> 
     Falls back to image-pipeline or synthetic MP4 on quota errors.
     """
     from genblaze_core import Pipeline, Modality
-    from genblaze_google.provider import VeoProvider
+    from genblaze_google import VeoProvider
 
     keys = api_keys or load_google_keys()
 
@@ -414,11 +447,9 @@ async def run_remix_pipeline(
         res = await run_image_pipeline(prompt, api_keys=api_keys)
 
     res["parent_run_id"] = parent_run_id
-    
-    # Update manifest in B2 to include parent_run_id reference
+
+    # Update manifest in B2/local to include parent_run_id reference
     try:
-        bucket = os.getenv("B2_BUCKET_NAME", "notary-media")
-        region = os.getenv("B2_REGION", "us-east-005")
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         manifest_key = f"runs/notary/{date_str}/{res['run_id']}/manifest.json"
 
@@ -443,7 +474,7 @@ async def run_remix_pipeline(
             "has_machine_readable_mark": False,
         }
 
-        backend = get_b2_backend()
+        backend = get_storage_backend()
         manifest_uri = backend.put(
             manifest_key,
             io.BytesIO(json.dumps(manifest_data, indent=2).encode()),
@@ -451,6 +482,6 @@ async def run_remix_pipeline(
         )
         res["manifest_uri"] = manifest_uri
     except Exception as e:
-        logger.warning("Failed to update parent lineage in B2 manifest: %s", e)
+        logger.warning("Failed to update parent lineage in manifest: %s", e)
 
     return res
