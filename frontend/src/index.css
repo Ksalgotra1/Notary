@@ -1089,6 +1089,11 @@ a:hover {
   border: 1px solid var(--danger-border);
 }
 
+.verify-result.partial {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+}
+
 .verify-result-icon {
   font-size: 2rem;
   flex-shrink: 0;

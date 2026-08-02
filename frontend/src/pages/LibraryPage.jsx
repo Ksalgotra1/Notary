@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import StatusBadge from '../components/StatusBadge';
@@ -10,11 +10,7 @@ export default function LibraryPage() {
   const [error, setError] = useState(null);
   const navigate = useNavigate();
 
-  useEffect(() => {
-    fetchAssets();
-  }, [filterModality]);
-
-  const fetchAssets = async () => {
+  const fetchAssets = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -28,7 +24,11 @@ export default function LibraryPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [filterModality]);
+
+  useEffect(() => {
+    fetchAssets();
+  }, [fetchAssets]);
 
   return (
     <div className="page">
@@ -114,27 +114,19 @@ export default function LibraryPage() {
                     style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                   >
                     <source src={asset.b2_asset_url} type="video/mp4" />
-                    <source src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4" type="video/mp4" />
                   </video>
                 </div>
               ) : (
                 <img
-                  src={
-                    asset.b2_asset_url ||
-                    `https://picsum.photos/seed/${asset.run_id}/600/600`
-                  }
+                  src={asset.b2_asset_url}
                   alt={asset.prompt}
                   className="asset-card-thumbnail"
-                  onError={(e) => {
-                    e.target.onerror = null;
-                    e.target.src = `https://picsum.photos/seed/${asset.run_id}/600/600`;
-                  }}
                 />
               )}
               <div className="asset-card-body">
                 <div className="flex justify-between items-center mb-2">
                   <StatusBadge status={asset.modality} type="modality" />
-                  <StatusBadge status="verified" />
+                  <StatusBadge status={asset.verify_status || 'unknown'} />
                 </div>
                 <div className="asset-card-prompt">{asset.prompt}</div>
                 <div className="asset-card-meta mt-3">

@@ -4,7 +4,6 @@ import api from '../api/client';
 const PROVIDER_COLORS = {
   google:       { bg: '#1a73e8', label: 'Google Genblaze' },
   nvidia:       { bg: '#76b900', label: 'NVIDIA NIM' },
-  pollinations: { bg: '#6366f1', label: 'Pollinations.ai' },
   unknown:      { bg: '#6b7280', label: 'Unknown' },
 };
 
@@ -42,7 +41,7 @@ export default function DashboardPage() {
       setMetrics(res.data);
       setLastRefresh(new Date().toLocaleTimeString());
       setError(null);
-    } catch (err) {
+    } catch {
       setError('Failed to load metrics.');
     } finally {
       setLoading(false);

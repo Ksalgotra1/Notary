@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import api from '../api/client';
 import StatusBadge from '../components/StatusBadge';
@@ -26,11 +26,7 @@ export default function AssetPage() {
   const [showBadge, setShowBadge] = useState(false);
   const [toast, setToast] = useState(null);
 
-  useEffect(() => {
-    loadData();
-  }, [runId]);
-
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -47,7 +43,11 @@ export default function AssetPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [runId]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   const handleVerify = async () => {
     setVerifying(true);
@@ -169,21 +169,12 @@ export default function AssetPage() {
             {asset.modality === 'video' ? (
               <video controls autoPlay loop playsInline key={asset.run_id}>
                 <source src={asset.b2_asset_url} type="video/mp4" />
-                <source src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4" type="video/mp4" />
-                <source src="https://vjs.zencdn.net/v/oceans.mp4" type="video/mp4" />
                 Your browser does not support video playback.
               </video>
             ) : (
               <img
-                src={
-                  asset.b2_asset_url ||
-                  `https://picsum.photos/seed/${asset.run_id}/800/800`
-                }
+                src={asset.b2_asset_url}
                 alt={asset.prompt}
-                onError={(e) => {
-                  e.target.onerror = null;
-                  e.target.src = `https://picsum.photos/seed/${asset.run_id}/800/800`;
-                }}
               />
             )}
           </div>

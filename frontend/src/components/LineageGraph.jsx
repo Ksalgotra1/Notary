@@ -13,7 +13,6 @@ import api from '../api/client';
 const PROVIDER_STYLES = {
   google:       { fill: '#1a73e8', label: 'Google' },
   nvidia:       { fill: '#76b900', label: 'NVIDIA' },
-  pollinations: { fill: '#6366f1', label: 'Pollinations' },
   unknown:      { fill: '#6b7280', label: 'Unknown' },
 };
 
@@ -76,7 +75,7 @@ export default function LineageGraph({ runId }) {
       try {
         const res = await api.get(`/assets/${runId}/lineage`);
         setData(res.data);
-      } catch (e) {
+      } catch {
         setError('Failed to load lineage data.');
       } finally {
         setLoading(false);

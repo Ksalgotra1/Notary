@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import api from '../api/client';
 import ComplianceCard from '../components/ComplianceCard';
@@ -17,11 +17,7 @@ export default function PublicVerifyPage() {
 
   const [copiedHash, setCopiedHash] = useState(false);
 
-  useEffect(() => {
-    loadPublicAssetInfo();
-  }, [runId]);
-
-  const loadPublicAssetInfo = async () => {
+  const loadPublicAssetInfo = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -33,7 +29,11 @@ export default function PublicVerifyPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [runId]);
+
+  useEffect(() => {
+    loadPublicAssetInfo();
+  }, [loadPublicAssetInfo]);
 
   // Web Crypto API SHA-256 calculation on client side
   const computeSHA256 = async (file) => {
@@ -89,22 +89,6 @@ export default function PublicVerifyPage() {
   const onFileChangeHandler = (e) => {
     if (e.target.files && e.target.files[0]) {
       handleFileDrop(e.target.files[0]);
-    }
-  };
-
-  const triggerMockTamperTest = async () => {
-    setDroppedFileName('modified_sample_asset.png');
-    setVerifying(true);
-    setVerifyResult(null);
-    try {
-      const res = await api.post(`/public/verify/${runId}`, {
-        file_hash: '1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff',
-      });
-      setVerifyResult(res.data);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setVerifying(false);
     }
   };
 
@@ -236,15 +220,6 @@ export default function PublicVerifyPage() {
                 <div className="drop-zone-hint">
                   Hash is computed in-browser; file bytes are sent only for forensic mismatch analysis
                 </div>
-              </div>
-
-              <div className="mt-3 flex justify-end">
-                <button
-                  className="btn btn-ghost btn-sm"
-                  onClick={triggerMockTamperTest}
-                >
-                  🧪 Test Tamper Detection (Simulate Mismatch)
-                </button>
               </div>
 
               {verifying && (
