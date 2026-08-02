@@ -1,27 +1,30 @@
 """API routes for the Notary backend."""
 import hashlib
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import unquote, urlparse
+import json
+import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from aiosqlite import Connection
 
-from cache import get_db, get_asset, list_assets, insert_asset, update_verify_status, update_compliance, get_lineage
+from cache import get_db, get_asset, list_assets, insert_asset, update_verify_status, update_compliance, update_policy_audit, get_lineage, find_cached_generation
 from compliance import evaluate_asset, manifest_data_from_db_row
+from policy import audit_image_bytes, review_prompt
 from models import (
     AssetDetail, AssetListResponse, AssetSummary,
     ComplianceReport,
     ForensicDetail,
-    GenerateRequest, GenerateResponse,
+    GenerateRequest, GenerateResponse, PromptReviewRequest, PromptReviewResponse, PolicyAuditSummary,
     PublicAssetInfo, PublicVerifyRequest,
     RemixRequest,
     VerifyResponse,
 )
-from pipeline import run_image_pipeline, run_video_pipeline, run_remix_pipeline, get_storage_backend, verify_manifest_signature
+from pipeline import run_image_pipeline, run_video_pipeline, run_remix_pipeline, get_b2_backend, get_b2_storage, verify_embedded_receipt
 from forensics import analyze_tampering
 from rebuild_cache import main as run_rebuild_cache
 from metrics import record_generation, get_metrics
@@ -31,27 +34,178 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _asset_key_from_url(asset_url: str) -> str:
-    path = unquote(urlparse(asset_url).path)
-    if "/file/" in path:
-        parts = path.split("/file/", 1)[1].split("/", 1)
-        if len(parts) == 2:
-            return parts[1]
-
-    key_index = asset_url.find("runs/")
-    if key_index != -1:
-        return asset_url[key_index:]
-    raise ValueError(f"Cannot derive B2 object key from URL: {asset_url}")
-
-
 async def _read_b2_asset_bytes(row: dict) -> bytes:
-    data = get_storage_backend().get(_asset_key_from_url(row["b2_asset_url"]))
-    if isinstance(data, bytes):
-        return data
-    if hasattr(data, "read"):
-        value = data.read()
-        return await value if hasattr(value, "__await__") else value
-    return bytes(data)
+    """Read asset bytes from B2. Falls back to direct HTTP for non-B2 URLs."""
+    try:
+        backend = get_b2_backend()
+        key = backend.key_from_url(row["b2_asset_url"])
+        if key:
+            data = backend.get(key)
+            if isinstance(data, bytes):
+                return data
+            if hasattr(data, "read"):
+                value = data.read()
+                return await value if hasattr(value, "__await__") else value
+            return bytes(data)
+    except Exception as e:
+        logger.debug("B2 read failed for %s: %s — trying HTTP", row["b2_asset_url"], e)
+
+    # Fallback: direct HTTP download for non-B2 URLs (HuggingFace, etc.)
+    import httpx
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(row["b2_asset_url"])
+        resp.raise_for_status()
+        return resp.content
+
+
+async def _read_asset_url_bytes(asset_url: str) -> bytes:
+    """Read asset bytes by URL. Falls back to direct HTTP for non-B2 URLs."""
+    try:
+        backend = get_b2_backend()
+        key = backend.key_from_url(asset_url)
+        if key:
+            data = backend.get(key)
+            return data if isinstance(data, bytes) else bytes(data.read())
+    except Exception as e:
+        logger.debug("B2 read failed for %s: %s — trying HTTP", asset_url, e)
+
+    import httpx
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(asset_url)
+        resp.raise_for_status()
+        return resp.content
+
+
+async def _write_policy_audit_manifest(
+    *, run_id: str, prompt: str, modality: str, profile: str, prompt_audit: dict, visual_audit: dict,
+) -> str:
+    """Write a separate locked M2 policy-audit record; M1 bytes never change."""
+    from genblaze_core.models.enums import Modality as GenblazeModality, StepType
+    from genblaze_core.models.manifest import Manifest
+    from genblaze_core.models.run import Run
+    from genblaze_core.models.step import Step
+
+    audit_run = Run(
+        run_id=str(uuid.uuid4()), name="notary-policy-audit", parent_run_id=run_id,
+        metadata={
+            "app": "notary", "provenance_version": "2", "audit_type": "policy",
+            "policy_profile": profile, "prompt_audit": prompt_audit, "visual_audit": visual_audit,
+        },
+        steps=[Step(
+            provider="notary-policy", model=visual_audit.get("model") or "deterministic-policy-v1",
+            step_type=StepType.CUSTOM,
+            modality=GenblazeModality.VIDEO if modality == "video" else GenblazeModality.IMAGE,
+            prompt=prompt,
+            metadata={"policy_profile": profile, "prompt_audit": prompt_audit, "visual_audit": visual_audit},
+        )],
+    )
+    manifest = Manifest.from_run(audit_run)
+    await asyncio.to_thread(get_b2_storage().write_run, audit_run, manifest)
+    if not manifest.manifest_uri:
+        raise RuntimeError("Policy audit manifest was not assigned a durable B2 URI")
+    return manifest.manifest_uri
+
+
+async def _run_and_store_policy_audit(db: Connection, req: GenerateRequest, result: dict) -> PolicyAuditSummary:
+    prompt_audit = review_prompt(req.prompt, req.policy_profile)
+    if req.modality.value == "image":
+        try:
+            visual_audit = await audit_image_bytes(
+                await _read_asset_url_bytes(result["asset_url"]), profile=req.policy_profile, prompt=req.prompt,
+            )
+        except Exception as exc:
+            logger.warning("Visual audit could not read generated asset %s: %s", result["run_id"], exc)
+            visual_audit = {
+                "status": "unavailable", "mode": "asset_read_error", "model": None, "findings": [],
+                "summary": "Visual audit could not read the generated asset; provenance verification remains available.",
+            }
+    else:
+        visual_audit = {
+            "status": "unavailable", "mode": "unsupported_modality", "model": None, "findings": [],
+            "summary": "Visual audit currently supports images only.",
+        }
+    try:
+        manifest_uri = await _write_policy_audit_manifest(
+            run_id=result["run_id"], prompt=req.prompt, modality=req.modality.value,
+            profile=req.policy_profile, prompt_audit=prompt_audit, visual_audit=visual_audit,
+        )
+    except Exception as exc:
+        logger.warning("Policy audit manifest could not be locked for %s: %s", result["run_id"], exc)
+        manifest_uri = None
+    await update_policy_audit(
+        db, result["run_id"], profile=req.policy_profile,
+        prompt_audit_json=json.dumps(prompt_audit), visual_audit_json=json.dumps(visual_audit),
+        policy_manifest_url=manifest_uri,
+    )
+    return PolicyAuditSummary(
+        profile=req.policy_profile, prompt_audit=PromptReviewResponse(**prompt_audit),
+        visual_audit=visual_audit, manifest_uri=manifest_uri,
+    )
+
+
+def _policy_audit_from_row(row: dict) -> PolicyAuditSummary | None:
+    if not row.get("prompt_audit_json"):
+        return None
+    try:
+        return PolicyAuditSummary(
+            profile=row.get("policy_profile") or "general",
+            prompt_audit=PromptReviewResponse(**json.loads(row["prompt_audit_json"])),
+            visual_audit=json.loads(row["visual_audit_json"]) if row.get("visual_audit_json") else None,
+            manifest_uri=row.get("policy_manifest_url"),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Could not parse policy audit cache for %s: %s", row.get("run_id"), exc)
+        return None
+
+
+def _runtime_asset_url(asset_url: str) -> str:
+    """Create a short-lived browser delivery URL without altering the manifest URL.
+    Falls back to the original URL for assets not owned by the configured B2 backend
+    (e.g. HuggingFace Space URLs returned by Genblaze's internal provider cascade).
+    """
+    try:
+        backend = get_b2_backend()
+        key = backend.key_from_url(asset_url)
+        if key:
+            return backend.get_url(key, expires_in=3600)
+    except Exception as e:
+        logger.debug("_runtime_asset_url: B2 URL generation failed (%s), returning original", e)
+    return asset_url
+
+
+
+async def _load_verified_manifest(row: dict):
+    """Read and validate the canonical Genblaze manifest stored in B2.
+    Falls back to direct HTTP for non-B2 manifest URLs."""
+    from genblaze_core.models.manifest import parse_manifest
+
+    raw = None
+    try:
+        backend = get_b2_backend()
+        key = backend.key_from_url(row["b2_manifest_url"])
+        if key:
+            raw = backend.get(key)
+    except Exception as e:
+        logger.debug("B2 manifest read failed: %s — trying HTTP", e)
+
+    if raw is None:
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(row["b2_manifest_url"])
+            resp.raise_for_status()
+            raw = resp.content
+
+    if hasattr(raw, "read"):
+        raw = raw.read()
+    manifest = parse_manifest(json.loads(bytes(raw).decode("utf-8")))
+    if not manifest.verify_hash():
+        raise ValueError("Genblaze manifest canonical hash verification failed")
+    if manifest.run.run_id != row["run_id"]:
+        raise ValueError("Genblaze manifest run ID does not match the requested asset")
+    assets = [asset for step in manifest.run.steps for asset in step.assets]
+    if not assets or not assets[-1].sha256:
+        raise ValueError("Genblaze manifest has no verifiable output asset")
+    return manifest, assets[-1]
 
 
 async def _forensic_detail(row: dict, submitted_bytes: bytes) -> ForensicDetail | None:
@@ -69,9 +223,48 @@ async def _forensic_detail(row: dict, submitted_bytes: bytes) -> ForensicDetail 
 
 # ── Core generation endpoints ─────────────────────────────────────
 
+@router.post("/policy/prompt-review", response_model=PromptReviewResponse)
+async def prompt_review(req: PromptReviewRequest):
+    """Review a prompt without sending it to a provider or altering it."""
+    try:
+        return PromptReviewResponse(**review_prompt(req.prompt, req.policy_profile))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _enforce_prompt_policy(req: GenerateRequest) -> dict:
+    try:
+        audit = review_prompt(req.prompt, req.policy_profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if audit["status"] == "block":
+        raise HTTPException(status_code=422, detail={"message": "Prompt is blocked by the selected policy profile.", "policy_audit": audit})
+    if audit["requires_acknowledgement"] and not req.policy_acknowledged:
+        raise HTTPException(status_code=409, detail={"message": "Review policy warnings before generation.", "policy_audit": audit})
+    return audit
+
+
 @router.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest, db: Connection = Depends(get_db)):
     """FR-1/FR-2: Generate image or video via Genblaze Pipeline → B2."""
+    _enforce_prompt_policy(req)
+
+    # ── Prompt cache: return existing result if exact match within TTL ──
+    cached = await find_cached_generation(db, req.prompt, req.modality.value)
+    if cached:
+        logger.info("Cache HIT for prompt=%s modality=%s → run_id=%s",
+                     req.prompt[:40], req.modality.value, cached["run_id"])
+        return GenerateResponse(
+            run_id=cached["run_id"],
+            status="completed",
+            asset_url=_runtime_asset_url(cached["b2_asset_url"]),
+            manifest_uri=cached["b2_manifest_url"],
+            sha256=cached["sha256"],
+            provider=cached["provider"],
+            model=cached["model"],
+        )
+    # ── End cache check ──
+
     t0 = time.monotonic()
     try:
         if req.modality.value == "video":
@@ -97,37 +290,17 @@ async def generate(req: GenerateRequest, db: Connection = Depends(get_db)):
         latency_ms=latency_ms,
     )
 
-    created_at = datetime.now(timezone.utc).isoformat()
-    row = {
-        "run_id": res["run_id"],
-        "parent_run_id": res.get("parent_run_id"),
-        "provider": res.get("provider", "google"),
-        "model": res.get("model", "unknown"),
-        "modality": req.modality.value,
-        "prompt": req.prompt,
-        "b2_asset_url": res["asset_url"],
-        "b2_manifest_url": res["manifest_uri"],
-        "sha256": res["sha256"],
-        "created_at": created_at,
-        "last_verified_at": None,
-        "verify_status": None,
-        "has_embedded_metadata": 1 if res.get("has_embedded_metadata") else 0,
-        "has_visible_label": 1 if res.get("has_visible_label") else 0,
-        "has_machine_readable_mark": 1 if res.get("has_machine_readable_mark") else 0,
-        "has_audio_disclosure": 0,
-        "compliance_evaluated_at": None,
-        "india_compliant": None,
-        "eu_compliant": None,
-    }
-    await insert_asset(db, row)
+    await _save_asset_to_db(db, req, res)
+    policy_audit = await _run_and_store_policy_audit(db, req, res)
     return GenerateResponse(
         run_id=res["run_id"],
         status="completed",
-        asset_url=res["asset_url"],
+        asset_url=_runtime_asset_url(res["asset_url"]),
         manifest_uri=res["manifest_uri"],
         sha256=res["sha256"],
         provider=res.get("provider"),
         model=res.get("model"),
+        policy_audit=policy_audit,
     )
 
 
@@ -140,8 +313,13 @@ async def list_assets_route(
 ):
     """FR-9: List assets from SQLite cache."""
     rows = await list_assets(db, limit=limit, provider=provider, modality=modality)
+    response_rows = []
+    for row in rows:
+        response_row = dict(row)
+        response_row["b2_asset_url"] = _runtime_asset_url(row["b2_asset_url"])
+        response_rows.append(response_row)
     return AssetListResponse(
-        assets=[AssetSummary(**r) for r in rows],
+        assets=[AssetSummary(**r) for r in response_rows],
         total=len(rows),
     )
 
@@ -152,7 +330,10 @@ async def get_asset_route(run_id: str, db: Connection = Depends(get_db)):
     row = await get_asset(db, run_id)
     if not row:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-    return AssetDetail(**row)
+    response_row = dict(row)
+    response_row["b2_asset_url"] = _runtime_asset_url(row["b2_asset_url"])
+    response_row["policy_audit"] = _policy_audit_from_row(row)
+    return AssetDetail(**response_row)
 
 
 @router.post("/assets/{run_id}/verify", response_model=VerifyResponse)
@@ -165,33 +346,21 @@ async def verify_asset(run_id: str, db: Connection = Depends(get_db)):
     if not row:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
-    manifest_hash = row["sha256"]
-
     try:
+        manifest, manifest_asset = await _load_verified_manifest(row)
         original_bytes = await _read_b2_asset_bytes(row)
         computed_hash = hashlib.sha256(original_bytes).hexdigest()
+        embedded_chain_valid = verify_embedded_receipt(manifest, original_bytes)
     except Exception as e:
-        logger.warning("Failed to fetch asset from B2: %s", e)
-        computed_hash = manifest_hash
+        logger.warning("Native Genblaze verification failed for %s: %s", run_id, e)
+        raise HTTPException(status_code=502, detail=f"Unable to verify canonical provenance: {e}") from e
 
-    match = computed_hash.lower() == manifest_hash.lower()
-
-    forensic = None
-    if not match:
-        # B2 asset re-fetch mismatch — actual corruption or modification.
-        # Run forensic comparison: original from B2 vs re-fetched (which may differ)
-        forensic = ForensicDetail(
-            modifications_detected=[
-                "Internal hash recomputation mismatch: the file stored in B2 does not match "
-                "its original SHA-256 fingerprint recorded at generation time."
-            ],
-            severity="major",
-            conclusion=(
-                "This indicates the asset in B2 has been modified or corrupted after generation. "
-                "This is a storage integrity failure, not a user tampering event."
-            ),
-            analysis_model="hash-comparison",
-        )
+    manifest_hash = manifest_asset.sha256
+    match = (
+        embedded_chain_valid
+        and computed_hash.lower() == manifest_hash.lower()
+        and row["sha256"].lower() == manifest_hash.lower()
+    )
 
     verified_at = datetime.now(timezone.utc).isoformat()
     status_str = "pass" if match else "fail"
@@ -202,7 +371,8 @@ async def verify_asset(run_id: str, db: Connection = Depends(get_db)):
         computed_hash=computed_hash,
         manifest_hash=manifest_hash,
         verified_at=verified_at,
-        forensic_analysis=forensic,
+        forensic_analysis=None,
+        manifest_valid=embedded_chain_valid,
     )
 
 
@@ -220,33 +390,11 @@ async def remix_asset(run_id: str, req: RemixRequest, db: Connection = Depends(g
         modality=parent["modality"],
     )
 
-    created_at = datetime.now(timezone.utc).isoformat()
-    row = {
-        "run_id": res["run_id"],
-        "parent_run_id": run_id,
-        "provider": res.get("provider", "google"),
-        "model": res.get("model", "unknown"),
-        "modality": parent["modality"],
-        "prompt": req.prompt,
-        "b2_asset_url": res["asset_url"],
-        "b2_manifest_url": res["manifest_uri"],
-        "sha256": res["sha256"],
-        "created_at": created_at,
-        "last_verified_at": None,
-        "verify_status": None,
-        "has_embedded_metadata": 1 if res.get("has_embedded_metadata") else 0,
-        "has_visible_label": 1 if res.get("has_visible_label") else 0,
-        "has_machine_readable_mark": 1 if res.get("has_machine_readable_mark") else 0,
-        "has_audio_disclosure": 0,
-        "compliance_evaluated_at": None,
-        "india_compliant": None,
-        "eu_compliant": None,
-    }
-    await insert_asset(db, row)
+    await _save_asset_to_db(db, req, res, modality=parent["modality"])
     return GenerateResponse(
         run_id=res["run_id"],
         status="completed",
-        asset_url=res["asset_url"],
+        asset_url=_runtime_asset_url(res["asset_url"]),
         manifest_uri=res["manifest_uri"],
         sha256=res["sha256"],
     )
@@ -299,6 +447,7 @@ async def public_asset_info(run_id: str, db: Connection = Depends(get_db)):
         created_at=row["created_at"],
         sha256=row["sha256"],
         compliance_report=ComplianceReport(**report),
+        policy_audit=_policy_audit_from_row(row),
     )
 
 
@@ -318,20 +467,12 @@ async def public_verify(
     if not row:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
-    manifest_hash = row["sha256"]
+    try:
+        _, manifest_asset = await _load_verified_manifest(row)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Canonical provenance is unavailable: {e}") from e
+    manifest_hash = manifest_asset.sha256
     is_match = req.file_hash.lower() == manifest_hash.lower()
-
-    forensic = None
-    if not is_match:
-        # Hash-only verification: we don't have the actual file bytes here.
-        # Return a clear guidance message directing the user to upload the file
-        # for full Gemini Vision forensic analysis (available via /file endpoint).
-        forensic = ForensicDetail(
-            modifications_detected=["SHA-256 hash mismatch detected — the submitted hash does not match the canonical provenance record."],
-            severity="unknown",
-            conclusion="Upload the actual file to /public/verify/{run_id}/file for AI-powered forensic analysis identifying exactly what was modified.",
-            analysis_model="hash-comparison",
-        )
 
     verified_at = datetime.now(timezone.utc).isoformat()
     return VerifyResponse(
@@ -339,7 +480,8 @@ async def public_verify(
         computed_hash=req.file_hash,
         manifest_hash=manifest_hash,
         verified_at=verified_at,
-        forensic_analysis=forensic,
+        forensic_analysis=None,
+        manifest_valid=True,
     )
 
 
@@ -372,12 +514,21 @@ async def public_verify_file(
     if computed_hash.lower() != file_hash.lower():
         raise HTTPException(status_code=400, detail="Submitted hash does not match uploaded file content")
 
-    manifest_hash = row["sha256"]
+    try:
+        manifest, manifest_asset = await _load_verified_manifest(row)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Canonical provenance is unavailable: {e}") from e
+    manifest_hash = manifest_asset.sha256
     is_match = computed_hash.lower() == manifest_hash.lower()
-
+    embedded_chain_valid = True
     forensic = None
-    if not is_match:
-        # Only on mismatch: re-read file for Gemini Vision forensic analysis
+    if is_match:
+        await file.seek(0)
+        submitted_bytes = await file.read()
+        embedded_chain_valid = verify_embedded_receipt(manifest, submitted_bytes)
+        is_match = embedded_chain_valid
+    else:
+        # Only on mismatch: re-read file for Gemini Vision forensic analysis.
         await file.seek(0)
         submitted_bytes = await file.read()
         forensic = await _forensic_detail(row, submitted_bytes)
@@ -388,6 +539,7 @@ async def public_verify_file(
         manifest_hash=manifest_hash,
         verified_at=datetime.now(timezone.utc).isoformat(),
         forensic_analysis=forensic,
+        manifest_valid=embedded_chain_valid,
     )
 
 
@@ -395,7 +547,7 @@ async def public_verify_file(
 
 @router.post("/admin/reindex")
 async def reindex():
-    """FR-9: Rebuild SQLite cache from B2 via genblaze index."""
+    """FR-9: Rebuild the SQLite cache from canonical manifests in B2."""
     try:
         await run_rebuild_cache()
         return {"status": "reindex_completed", "message": "Cache successfully rebuilt from B2 manifests."}
@@ -405,7 +557,7 @@ async def reindex():
 
 @router.post("/admin/audit")
 async def run_audit():
-    """Add-on #9: Full B2 integrity audit — re-hash every asset, verify HMAC signatures."""
+    """Full B2 integrity audit using Genblaze canonical-manifest verification."""
     try:
         report = await run_full_audit()
         return report
@@ -491,133 +643,94 @@ import json as json_mod
 
 @router.post("/generate/stream")
 async def generate_stream(req: GenerateRequest, db: Connection = Depends(get_db)):
-    """
-    Add-on: Server-Sent Events stream that reports real-time cascade progress.
-    The client receives events like:
-      data: {"stage": "trying_google", "message": "Trying Google Genblaze..."}
-      data: {"stage": "google_quota_error", "message": "Google quota exhausted, rotating..."}
-      data: {"stage": "trying_nvidia", "message": "Trying NVIDIA NIM..."}
-      data: {"stage": "completed", "run_id": "abc123", "asset_url": "..."}
-    """
+    """Stream the same Genblaze-only provider cascade used by ``/generate``."""
     async def event_stream():
-        import pipeline as pl
-
         t0 = time.monotonic()
-        stages = []
 
-        def emit(stage: str, message: str, **extra):
+        def emit_genblaze(stage: str, message: str, **extra):
             event = {"stage": stage, "message": message, "elapsed_ms": int((time.monotonic() - t0) * 1000), **extra}
-            stages.append(event)
             return f"data: {json_mod.dumps(event)}\n\n"
 
-        # --- Try Google ---
-        keys = pl.load_google_keys()
-        if keys and req.modality.value == "image":
-            yield emit("trying_google", "Attempting Google Genblaze pipeline...")
-            try:
-                multi = pl.MultiKeyGoogleProvider(keys, pl._get_google_image_provider_class())
-                while True:
-                    provider = multi.get_provider()
-                    try:
-                        from genblaze_core import Pipeline, Modality
-                        storage = pl.get_b2_storage()
-                        run, manifest = await (
-                            Pipeline("notary-image-generate")
-                            .step(provider, model=pl.IMAGE_MODEL_ID, prompt=req.prompt, modality=Modality.IMAGE)
-                            .arun(sink=storage, timeout=120)
-                        )
-                        asset = run.steps[0].assets[0]
-                        res = {
-                            "run_id": run.run_id, "asset_url": asset.url,
-                            "manifest_uri": manifest.manifest_uri, "sha256": asset.sha256,
-                            "provider": "google", "model": pl.IMAGE_MODEL_ID,
-                            "has_embedded_metadata": True, "has_visible_label": False,
-                            "has_machine_readable_mark": False,
-                        }
-                        yield emit("google_success", f"Google succeeded (model: {pl.IMAGE_MODEL_ID})")
-                        # Save to DB and emit completion
-                        latency_ms = int((time.monotonic() - t0) * 1000)
-                        await record_generation(run_id=res["run_id"], provider="google", model=pl.IMAGE_MODEL_ID,
-                                                modality="image", success=True, latency_ms=latency_ms)
-                        await _save_asset_to_db(db, req, res)
-                        yield emit("completed", "Generation complete!", **res)
-                        return
-                    except Exception as e:
-                        if pl._is_quota_error(e):
-                            yield emit("google_quota_error", f"Google key {multi.current_key_index} quota exhausted, rotating...")
-                            if not multi.advance():
-                                yield emit("google_exhausted", "All Google API keys exhausted.")
-                                break
-                        else:
-                            yield emit("google_error", f"Google failed: {str(e)[:80]}")
-                            break
-            except Exception as e:
-                yield emit("google_error", f"Google setup failed: {str(e)[:80]}")
-
-        # --- Try NVIDIA NIM ---
-        nv_key = os.getenv("NVIDIA_API_KEY", "")
-        if nv_key and req.modality.value == "image":
-            yield emit("trying_nvidia", "Attempting NVIDIA NIM pipeline...")
-            try:
-                res = await pl._run_nvidia_pipeline(req.prompt)
-                latency_ms = int((time.monotonic() - t0) * 1000)
-                await record_generation(run_id=res["run_id"], provider="nvidia", model=res["model"],
-                                        modality="image", success=True, latency_ms=latency_ms)
-                yield emit("nvidia_success", f"NVIDIA succeeded (model: {res['model']})")
-                await _save_asset_to_db(db, req, res)
-                yield emit("completed", "Generation complete!", **res)
-                return
-            except Exception as e:
-                yield emit("nvidia_error", f"NVIDIA failed: {str(e)[:80]}")
-
-        # --- Pollinations fallback ---
-        yield emit("trying_pollinations", "Falling back to Pollinations.ai (always available)...")
         try:
-            res = await pl._run_pollinations_pipeline(req.prompt)
+            policy_audit = _enforce_prompt_policy(req)
+        except HTTPException as exc:
+            detail = exc.detail.get("message") if isinstance(exc.detail, dict) else str(exc.detail)
+            yield emit_genblaze("policy_blocked", detail, policy_audit=exc.detail.get("policy_audit") if isinstance(exc.detail, dict) else None)
+            return
+        yield emit_genblaze("policy_reviewed", f"{policy_audit['status'].upper()} policy review completed.", policy_audit=policy_audit)
+
+        # ── Prompt cache: skip provider cascade if exact match within TTL ──
+        cached = await find_cached_generation(db, req.prompt, req.modality.value)
+        if cached:
+            client_result = {
+                "run_id": cached["run_id"],
+                "asset_url": _runtime_asset_url(cached["b2_asset_url"]),
+                "manifest_uri": cached["b2_manifest_url"],
+                "sha256": cached["sha256"],
+                "provider": cached["provider"],
+                "model": cached["model"],
+            }
+            yield emit_genblaze("cache_hit", f"Exact prompt match found (cached {cached['created_at'][:16]}). Skipping provider cascade.", **client_result)
+            yield emit_genblaze("completed", "Served from cache!", **client_result)
+            return
+        # ── End cache check ──
+
+        yield emit_genblaze("starting", "Starting the Genblaze pipeline with B2 File Lock provenance...")
+        try:
+            res = await (run_video_pipeline(req.prompt) if req.modality.value == "video" else run_image_pipeline(req.prompt))
             latency_ms = int((time.monotonic() - t0) * 1000)
-            await record_generation(run_id=res["run_id"], provider="pollinations", model=res["model"],
-                                    modality="image", success=True, latency_ms=latency_ms)
-            yield emit("pollinations_success", f"Pollinations succeeded (model: {res['model']})")
+            await record_generation(
+                run_id=res["run_id"], provider=res["provider"], model=res["model"],
+                modality=req.modality.value, success=True, latency_ms=latency_ms,
+            )
             await _save_asset_to_db(db, req, res)
-            yield emit("completed", "Generation complete!", **res)
-        except Exception as e:
+            policy_audit = await _run_and_store_policy_audit(db, req, res)
+            client_result = {**res, "asset_url": _runtime_asset_url(res["asset_url"])}
+            client_result["policy_audit"] = policy_audit.model_dump()
+            yield emit_genblaze("completed", f"{res['provider']} Genblaze pipeline completed.", **client_result)
+        except Exception as exc:
             latency_ms = int((time.monotonic() - t0) * 1000)
-            await record_generation(run_id=None, provider="unknown", model="unknown",
-                                    modality=req.modality.value, success=False,
-                                    latency_ms=latency_ms, error_type=type(e).__name__)
-            yield emit("failed", f"All providers failed: {str(e)[:120]}")
+            await record_generation(
+                run_id=None, provider="unknown", model="unknown", modality=req.modality.value,
+                success=False, latency_ms=latency_ms, error_type=type(exc).__name__,
+            )
+            yield emit_genblaze("failed", str(exc)[:240])
+        return
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-import os
-
-
-async def _save_asset_to_db(db, req, res):
+async def _save_asset_to_db(db, req, res, modality: str | None = None):
     """Helper to persist a generation result to the SQLite cache."""
     created_at = datetime.now(timezone.utc).isoformat()
-    row = {
-        "run_id": res["run_id"],
-        "parent_run_id": res.get("parent_run_id"),
-        "provider": res.get("provider", "google"),
-        "model": res.get("model", "unknown"),
-        "modality": req.modality.value,
-        "prompt": req.prompt,
-        "b2_asset_url": res["asset_url"],
-        "b2_manifest_url": res["manifest_uri"],
-        "sha256": res["sha256"],
-        "created_at": created_at,
-        "last_verified_at": None,
-        "verify_status": None,
-        "has_embedded_metadata": 1 if res.get("has_embedded_metadata") else 0,
-        "has_visible_label": 1 if res.get("has_visible_label") else 0,
-        "has_machine_readable_mark": 1 if res.get("has_machine_readable_mark") else 0,
-        "has_audio_disclosure": 0,
-        "compliance_evaluated_at": None,
-        "india_compliant": None,
-        "eu_compliant": None,
-    }
-    await insert_asset(db, row)
+    def row_for(record: dict, *, is_distributed: bool) -> dict:
+        return {
+            "run_id": record["run_id"],
+            "parent_run_id": record.get("parent_run_id"),
+            "provider": record.get("provider", "google"),
+            "model": record.get("model", "unknown"),
+            "modality": modality or req.modality.value,
+            "prompt": req.prompt,
+            "b2_asset_url": record["asset_url"],
+            "b2_manifest_url": record["manifest_uri"],
+            "sha256": record["sha256"],
+            "created_at": created_at,
+            "last_verified_at": None,
+            "verify_status": None,
+            "has_embedded_metadata": 1 if record.get("has_embedded_metadata") else 0,
+            "has_visible_label": 1 if record.get("has_visible_label") else 0,
+            "has_machine_readable_mark": 1 if record.get("has_machine_readable_mark") else 0,
+            "has_audio_disclosure": 0,
+            "compliance_evaluated_at": None,
+            "india_compliant": None,
+            "eu_compliant": None,
+            "is_distributed": 1 if is_distributed else 0,
+        }
+
+    source_record = res.get("source_record")
+    if source_record:
+        await insert_asset(db, row_for(source_record, is_distributed=False))
+    await insert_asset(db, row_for(res, is_distributed=True))
 
 
 # ── Provenance Certificate ───────────────────────────────────────

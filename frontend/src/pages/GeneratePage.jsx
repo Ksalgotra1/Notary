@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import api from '../api/client';
 import StatusBadge from '../components/StatusBadge';
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -8,6 +7,9 @@ const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 export default function GeneratePage() {
   const [prompt, setPrompt] = useState('');
   const [modality, setModality] = useState('image');
+  const [policyProfile, setPolicyProfile] = useState('general');
+  const [policyReview, setPolicyReview] = useState(null);
+  const [policyAcknowledged, setPolicyAcknowledged] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
@@ -19,8 +21,29 @@ export default function GeneratePage() {
     e.preventDefault();
     if (!prompt.trim()) return;
 
-    setLoading(true);
     setError(null);
+    try {
+      const reviewResponse = await fetch(`${BASE_URL}/policy/prompt-review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, policy_profile: policyProfile }),
+      });
+      const review = await reviewResponse.json();
+      if (!reviewResponse.ok) throw new Error(review.detail || 'Policy review failed.');
+      setPolicyReview(review);
+      if (review.status === 'block') {
+        setError('This prompt is blocked by the selected policy profile.');
+        return;
+      }
+      if (review.requires_acknowledgement && !policyAcknowledged) {
+        return;
+      }
+    } catch (err) {
+      setError(err.message || 'Policy review failed.');
+      return;
+    }
+
+    setLoading(true);
     setResult(null);
     setGenTime(null);
     setCascadeLog([]);
@@ -31,7 +54,12 @@ export default function GeneratePage() {
       const response = await fetch(`${BASE_URL}/generate/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, modality }),
+        body: JSON.stringify({
+          prompt,
+          modality,
+          policy_profile: policyProfile,
+          policy_acknowledged: policyAcknowledged,
+        }),
       });
 
       if (!response.ok) {
@@ -63,8 +91,11 @@ export default function GeneratePage() {
                 setResult(event);
               } else if (event.stage === 'failed') {
                 setError(event.message);
+              } else if (event.stage === 'policy_blocked') {
+                setPolicyReview(event.policy_audit || null);
+                setError(event.message);
               }
-            } catch (parseErr) {
+            } catch {
               // skip malformed events
             }
           }
@@ -121,10 +152,56 @@ export default function GeneratePage() {
               className="textarea"
               placeholder="Describe the asset you want to generate (e.g., 'A golden notary seal on a dark marble desk, dramatic lighting')..."
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              onChange={(e) => {
+                setPrompt(e.target.value);
+                setPolicyReview(null);
+                setPolicyAcknowledged(false);
+              }}
               required
             />
           </div>
+
+          <div className="input-group mb-6">
+            <label className="input-label" htmlFor="policy-profile">Policy profile</label>
+            <select
+              id="policy-profile"
+              className="input"
+              value={policyProfile}
+              onChange={(e) => {
+                setPolicyProfile(e.target.value);
+                setPolicyReview(null);
+                setPolicyAcknowledged(false);
+              }}
+            >
+              <option value="general">General generation</option>
+              <option value="public-release">Public release review</option>
+              <option value="brand-safe">Brand-safe review</option>
+            </select>
+          </div>
+
+          {policyReview && (
+            <div className={`verify-result ${policyReview.status === 'block' ? 'fail' : policyReview.status === 'warning' ? 'partial' : 'pass'} mb-6`}>
+              <span className="verify-result-icon">
+                {policyReview.status === 'pass' ? '✓' : policyReview.status === 'warning' ? '!' : '×'}
+              </span>
+              <div className="verify-result-content">
+                <h3>Prompt policy review: {policyReview.status}</h3>
+                {policyReview.findings?.map((finding) => (
+                  <p key={finding.rule_id}><strong>{finding.rule_id}</strong> {finding.detail} {finding.suggestion}</p>
+                ))}
+                {policyReview.requires_acknowledgement && !policyAcknowledged && (
+                  <label className="text-sm" style={{ display: 'block', marginTop: 10 }}>
+                    <input
+                      type="checkbox"
+                      checked={policyAcknowledged}
+                      onChange={(e) => setPolicyAcknowledged(e.target.checked)}
+                    />{' '}
+                    I reviewed this warning and want the audit recorded with the asset.
+                  </label>
+                )}
+              </div>
+            </div>
+          )}
 
           <button
             type="submit"
@@ -142,7 +219,7 @@ export default function GeneratePage() {
               </>
             ) : (
               <>
-                <span>✨ Generate & Lock Provenance</span>
+                <span>{policyReview?.requires_acknowledgement && !policyAcknowledged ? 'Acknowledge Warning to Continue' : 'Generate & Lock Provenance'}</span>
               </>
             )}
           </button>
@@ -169,11 +246,13 @@ export default function GeneratePage() {
               🔀 PROVIDER CASCADE LOG
             </div>
             {cascadeLog.map((ev, i) => {
-              const icon = ev.stage.includes('success') || ev.stage === 'completed' ? '✅'
+              const icon = ev.stage === 'cache_hit' ? '⚡'
+                : ev.stage.includes('success') || ev.stage === 'completed' ? '✅'
                 : ev.stage.includes('error') || ev.stage.includes('exhausted') || ev.stage === 'failed' ? '❌'
                 : ev.stage.includes('trying') ? '🔄'
                 : ev.stage.includes('quota') ? '⚠️' : '•';
-              const color = ev.stage.includes('success') || ev.stage === 'completed' ? '#2ea44f'
+              const color = ev.stage === 'cache_hit' ? '#f59e0b'
+                : ev.stage.includes('success') || ev.stage === 'completed' ? '#2ea44f'
                 : ev.stage.includes('error') || ev.stage === 'failed' ? '#d73a49'
                 : '#e3a008';
               return (
@@ -206,7 +285,7 @@ export default function GeneratePage() {
                     ⚡ {genTime}s
                   </span>
                 )}
-                <StatusBadge status="verified" />
+                <StatusBadge status="unknown" />
               </div>
             </div>
 
@@ -219,26 +298,22 @@ export default function GeneratePage() {
                 className="generate-result-image"
               >
                 <source src={result.asset_url} type="video/mp4" />
-                <source src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4" type="video/mp4" />
-                <source src="https://vjs.zencdn.net/v/oceans.mp4" type="video/mp4" />
                 Your browser does not support video playback.
               </video>
             ) : (
               <img
-                src={
-                  result.asset_url ||
-                  `https://picsum.photos/seed/${result.run_id}/800/800`
-                }
+                src={result.asset_url}
                 alt="Generated output"
                 className="generate-result-image"
-                onError={(e) => {
-                  e.target.onerror = null;
-                  e.target.src = `https://picsum.photos/seed/${result.run_id}/800/800`;
-                }}
               />
             )}
 
             <div className="generate-result-meta">
+              {result.policy_audit && (
+                <div className="mb-4 text-sm">
+                  <strong>Policy audit:</strong> prompt {result.policy_audit.prompt_audit.status}; visual {result.policy_audit.visual_audit?.status || 'unavailable'}
+                </div>
+              )}
               <div>
                 <span className="text-xs text-secondary font-mono">
                   SHA-256 Hash:
