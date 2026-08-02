@@ -301,13 +301,27 @@ async def public_verify_file(
     file: UploadFile = File(...),
     db: Connection = Depends(get_db),
 ):
-    """Verify a public upload and run forensic analysis with actual submitted bytes."""
+    """Verify a public upload using streaming 64KB chunking and run forensic analysis."""
     row = await get_asset(db, run_id)
     if not row:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
-    submitted_bytes = await file.read()
-    computed_hash = hashlib.sha256(submitted_bytes).hexdigest()
+    # Streaming 64KB chunking for memory efficiency + size limit check (max 100 MB)
+    MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB limit
+    sha256_hasher = hashlib.sha256()
+    chunks = []
+    total_size = 0
+
+    while chunk := await file.read(65536):  # 64 KB chunk
+        total_size += len(chunk)
+        if total_size > MAX_FILE_SIZE:
+            raise HTTPException(status_code=413, detail="Uploaded file exceeds maximum limit of 100 MB")
+        sha256_hasher.update(chunk)
+        chunks.append(chunk)
+
+    submitted_bytes = b"".join(chunks)
+    computed_hash = sha256_hasher.hexdigest()
+
     if computed_hash.lower() != file_hash.lower():
         raise HTTPException(status_code=400, detail="Submitted hash does not match uploaded file")
 

@@ -9,3 +9,4 @@ genblaze-core
 genblaze-s3
 genblaze-google
 genblaze-nvidia
+python-multipart
