@@ -9,6 +9,7 @@ export default function GeneratePage() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [genTime, setGenTime] = useState(null);
   const navigate = useNavigate();
 
   const handleGenerate = async (e) => {
@@ -18,12 +19,16 @@ export default function GeneratePage() {
     setLoading(true);
     setError(null);
     setResult(null);
+    setGenTime(null);
+    const t0 = performance.now();
 
     try {
       const res = await api.post('/generate', {
         prompt,
         modality,
       });
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      setGenTime(elapsed);
       setResult(res.data);
     } catch (err) {
       console.error(err);
@@ -118,7 +123,23 @@ export default function GeneratePage() {
           <div className="generate-result border-t border-border pt-6 mt-6">
             <div className="flex justify-between items-center mb-4">
               <h3 className="text-lg font-semibold">Generated Asset</h3>
-              <StatusBadge status="verified" />
+              <div style={{display: 'flex', gap: '8px', alignItems: 'center'}}>
+                {result.provider && (
+                  <span style={{
+                    background: result.provider === 'google' ? '#1a73e8' : result.provider === 'nvidia' ? '#76b900' : '#6366f1',
+                    color: '#fff', fontSize: '11px', fontWeight: 700,
+                    padding: '2px 8px', borderRadius: '12px', textTransform: 'uppercase', letterSpacing: '0.5px'
+                  }}>
+                    {result.provider} / {result.model?.split('/').pop() || result.model}
+                  </span>
+                )}
+                {genTime && (
+                  <span style={{fontSize: '11px', color: 'var(--color-secondary)'}}>
+                    ⚡ {genTime}s
+                  </span>
+                )}
+                <StatusBadge status="verified" />
+              </div>
             </div>
 
             {modality === 'video' ? (

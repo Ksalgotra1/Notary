@@ -12,11 +12,13 @@ load_dotenv()
 from cache import init_db
 from pipeline import LOCAL_GENERATED_DIR
 from routes import router
+from metrics import init_metrics_db
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await init_metrics_db()
     yield
 
 

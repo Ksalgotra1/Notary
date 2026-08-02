@@ -33,6 +33,14 @@ export default function Navbar() {
         >
           Library
         </NavLink>
+        <NavLink
+          to="/dashboard"
+          className={({ isActive }) =>
+            `navbar-link ${isActive ? 'active' : ''}`
+          }
+        >
+          ⚡ Dashboard
+        </NavLink>
       </nav>
     </header>
   );

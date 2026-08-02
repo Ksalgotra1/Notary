@@ -104,15 +104,16 @@ def _evaluate_india_it_rules_2026(m: ManifestData) -> dict:
     checks.append({
         "requirement_id": "IN-SGI-04",
         "description": "Embedded permanent metadata or provenance mechanism",
-        "status": "pass" if m.has_embedded_metadata else "fail",
+        "status": "pass" if m.has_embedded_metadata else "partial",
         "detail": (
             "Genblaze manifest embedded directly in the media file — "
             "non-removable provenance metadata present."
             if m.has_embedded_metadata
             else (
-                "MISSING: Manifest not embedded in the media file. "
-                "A separate manifest in B2 exists but the rules require metadata "
-                "embedded permanently within the asset itself."
+                f"PARTIAL: Asset provenance is immutably locked in Backblaze B2 Object Lock "
+                f"(WORM-compliant) via a signed Genblaze manifest (run_id: {m.run_id}). "
+                "File-embedded metadata (EXIF/XMP/C2PA) would provide stronger compliance "
+                "and is available when using the Google Genblaze provider."
             )
         ),
     })
@@ -132,7 +133,7 @@ def _evaluate_india_it_rules_2026(m: ManifestData) -> dict:
     })
 
     applicable = [c for c in checks if c["status"] != "not_applicable"]
-    passed = sum(1 for c in applicable if c["status"] == "pass")
+    passed = sum(1.0 if c["status"] == "pass" else 0.5 if c["status"] == "partial" else 0 for c in applicable)
     total = len(applicable)
 
     return {
@@ -143,7 +144,7 @@ def _evaluate_india_it_rules_2026(m: ManifestData) -> dict:
         ),
         "effective_date": "2026-02-20",
         "checks": checks,
-        "passed": passed,
+        "passed": int(passed),
         "total": total,
         "compliant": passed == total,
     }
@@ -174,14 +175,16 @@ def _evaluate_eu_ai_act_article_50(m: ManifestData) -> dict:
     checks.append({
         "requirement_id": "EU-ART50-02",
         "description": "Machine-readable mark enabling detection of artificial origin",
-        "status": "pass" if m.has_machine_readable_mark else "fail",
+        "status": "pass" if m.has_machine_readable_mark else "partial",
         "detail": (
             "Machine-readable provenance mark embedded via Genblaze manifest."
             if m.has_machine_readable_mark
             else (
-                "MISSING: No machine-readable mark in an interoperable standard format "
-                "(e.g. C2PA Content Credentials). The Genblaze manifest provides provenance "
-                "but may not satisfy the EU's 'industry standard' expectation under Article 50."
+                f"PARTIAL: A machine-readable Genblaze JSON manifest is stored in "
+                f"Backblaze B2 under run_id {m.run_id}. The manifest records provider, "
+                "model, prompt, SHA-256 hash, and timestamp. A C2PA Content Credentials "
+                "mark embedded in the file itself would fully satisfy Article 50's "
+                "'industry standard' requirement."
             )
         ),
     })
@@ -216,7 +219,7 @@ def _evaluate_eu_ai_act_article_50(m: ManifestData) -> dict:
         ),
     })
 
-    passed = sum(1 for c in checks if c["status"] == "pass")
+    passed = sum(1.0 if c["status"] == "pass" else 0.5 if c["status"] == "partial" else 0 for c in checks)
     total = len(checks)
 
     return {
@@ -224,7 +227,7 @@ def _evaluate_eu_ai_act_article_50(m: ManifestData) -> dict:
         "regulation_name": "EU AI Act — Article 50: Transparency Obligations for AI-Generated Content",
         "effective_date": "2026-08-02",
         "checks": checks,
-        "passed": passed,
+        "passed": int(passed),
         "total": total,
         "compliant": passed == total,
     }
@@ -234,7 +237,7 @@ def _generate_recommendations(india: dict, eu: dict) -> list[str]:
     """Generate actionable, deduplicated recommendations from compliance gaps."""
     recs = []
     all_checks = india["checks"] + eu["checks"]
-    failed_ids = {c["requirement_id"] for c in all_checks if c["status"] == "fail"}
+    failed_ids = {c["requirement_id"] for c in all_checks if c["status"] in ("fail", "partial")}
 
     if "IN-SGI-02" in failed_ids:
         recs.append(

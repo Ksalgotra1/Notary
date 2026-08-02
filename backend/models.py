@@ -21,6 +21,8 @@ class GenerateResponse(BaseModel):
     asset_url: Optional[str] = None
     manifest_uri: Optional[str] = None
     sha256: Optional[str] = None
+    provider: Optional[str] = None   # e.g. "google" | "nvidia" | "pollinations"
+    model: Optional[str] = None      # e.g. "flux" | "gemini-2.5-flash-image"
 
 
 class AssetSummary(BaseModel):

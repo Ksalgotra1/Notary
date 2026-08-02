@@ -22,6 +22,7 @@ export default function AssetPage() {
   const [remixPrompt, setRemixPrompt] = useState('');
   const [remixing, setRemixing] = useState(false);
 
+  const [showBadge, setShowBadge] = useState(false);
   const [toast, setToast] = useState(null);
 
   useEffect(() => {
@@ -145,6 +146,9 @@ export default function AssetPage() {
           </button>
           <button className="btn btn-secondary" onClick={handleShare}>
             🔗 Copy Public Portal Link
+          </button>
+          <button className="btn btn-secondary" onClick={() => setShowBadge(true)}>
+            🛡️ Embed Badge
           </button>
         </div>
       </div>
@@ -280,6 +284,49 @@ export default function AssetPage() {
       {toast && (
         <div className={`toast toast-${toast.type}`}>
           {toast.message}
+        </div>
+      )}
+
+      {/* Badge Embed Modal */}
+      {showBadge && (
+        <div className="modal-overlay" onClick={() => setShowBadge(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <h2>🛡️ Embed Provenance Badge</h2>
+            <p className="text-xs text-secondary mb-4">
+              Embed this badge on any webpage to show the live verification status of this asset.
+            </p>
+            <div style={{ textAlign: 'center', marginBottom: 16 }}>
+              <img
+                src={`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/badge/${runId}`}
+                alt="Notary Provenance Badge"
+                style={{ height: 22 }}
+              />
+            </div>
+            <div className="input-group mb-4">
+              <label className="input-label">HTML Embed Code</label>
+              <textarea
+                className="textarea"
+                readOnly
+                rows={3}
+                value={`<a href="${window.location.origin}/verify/${runId}">\n  <img src="${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/badge/${runId}" alt="Verified by Notary" />\n</a>`}
+                onClick={e => e.target.select()}
+              />
+            </div>
+            <div className="modal-actions">
+              <button className="btn btn-secondary" onClick={() => setShowBadge(false)}>Close</button>
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  const code = `<a href="${window.location.origin}/verify/${runId}">\n  <img src="${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/badge/${runId}" alt="Verified by Notary" />\n</a>`;
+                  navigator.clipboard.writeText(code);
+                  showToast('Badge embed code copied!', 'success');
+                  setShowBadge(false);
+                }}
+              >
+                📋 Copy Embed Code
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

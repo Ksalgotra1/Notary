@@ -44,11 +44,14 @@ export default function PublicVerifyPage() {
     return hashHex;
   };
 
+  const [dropError, setDropError] = useState('');
+
   const handleFileDrop = async (file) => {
     if (!file) return;
     setDroppedFileName(file.name);
     setVerifying(true);
     setVerifyResult(null);
+    setDropError('');
 
     try {
       const fileHash = await computeSHA256(file);
@@ -59,7 +62,7 @@ export default function PublicVerifyPage() {
       setVerifyResult(res.data);
     } catch (err) {
       console.error(err);
-      alert('Verification request failed.');
+      setDropError(err.response?.data?.detail || 'Verification request failed. Please try again.');
     } finally {
       setVerifying(false);
     }
@@ -248,6 +251,16 @@ export default function PublicVerifyPage() {
                 <div className="loading-overlay my-4">
                   <div className="spinner" />
                   <span>Computing SHA-256 hash & running forensic analysis...</span>
+                </div>
+              )}
+
+              {dropError && (
+                <div className="verify-result fail mt-4">
+                  <span className="verify-result-icon">❌</span>
+                  <div className="verify-result-content">
+                    <h3>Verification Error</h3>
+                    <p>{dropError}</p>
+                  </div>
                 </div>
               )}
 

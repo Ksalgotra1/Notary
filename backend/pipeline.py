@@ -10,6 +10,7 @@ The cascade tries providers in order, rotating keys on quota errors.
 B2 storage via genblaze-s3 is used for all paths.
 """
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -17,6 +18,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+import asyncio
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,39 @@ NVIDIA_IMAGE_MODEL_SECONDARY = "stabilityai/stable-diffusion-3-5-large"
 POLLINATIONS_MODEL = "flux"
 POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
 LOCAL_GENERATED_DIR = Path(__file__).resolve().parent / "generated"
+
+# ── Manifest signing ─────────────────────────────────────────────────────────
+# Server-side HMAC secret — set MANIFEST_SIGNING_SECRET in .env for production.
+# Without this, anyone with B2 write access could forge a manifest.
+MANIFEST_SIGNING_SECRET = os.getenv("MANIFEST_SIGNING_SECRET", "notary-dev-secret-change-in-prod")
+
+
+def sign_manifest(manifest_data: dict) -> dict:
+    """
+    Add an HMAC-SHA256 signature to a manifest dict.
+    The signature covers all fields except _signature itself,
+    computed over the JSON body sorted by key for determinism.
+    """
+    # Strip any existing signature before signing
+    payload = {k: v for k, v in manifest_data.items() if k != "_signature"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    sig = hmac.new(MANIFEST_SIGNING_SECRET.encode(), canonical, hashlib.sha256).hexdigest()
+    return {**manifest_data, "_signature": sig}
+
+
+def verify_manifest_signature(manifest_data: dict) -> bool:
+    """
+    Verify the HMAC-SHA256 signature on a manifest.
+    Returns True if signature is valid, False otherwise.
+    """
+    expected_sig = manifest_data.get("_signature")
+    if not expected_sig:
+        return False
+    payload = {k: v for k, v in manifest_data.items() if k != "_signature"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    actual_sig = hmac.new(MANIFEST_SIGNING_SECRET.encode(), canonical, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected_sig, actual_sig)
+
 
 
 class MultiKeyGoogleProvider:
@@ -129,19 +164,27 @@ class LocalStorageBackend:
         return (LOCAL_GENERATED_DIR / key).read_bytes()
 
 
+_cached_backend = None
+
+
 def get_storage_backend():
     """
     Prefer B2; fall back to local files so the site remains testable.
+    Cached as a module-level singleton — instantiated once, reused across all requests.
     Catches: missing module, missing/wrong credentials, bucket not found.
     """
+    global _cached_backend
+    if _cached_backend is not None:
+        return _cached_backend
     try:
         backend = get_b2_backend()
         logger.info("B2 storage backend connected (bucket=%s)", os.getenv("B2_BUCKET_NAME"))
-        return backend
+        _cached_backend = backend
     except Exception as e:
         logger.warning("B2 backend unavailable (%s: %s); using local generated storage",
                        type(e).__name__, e)
-        return LocalStorageBackend()
+        _cached_backend = LocalStorageBackend()
+    return _cached_backend
 
 
 def _is_quota_error(e: Exception) -> bool:
@@ -236,7 +279,7 @@ async def _run_nvidia_pipeline(prompt: str) -> dict:
                 prompt=prompt,
                 modality=Modality.IMAGE,
             )
-            res_step = provider.invoke(step)
+            res_step = await asyncio.to_thread(provider.invoke, step)
             if res_step.assets:
                 asset = res_step.assets[0]
                 if hasattr(asset, "data") and asset.data:
@@ -257,7 +300,7 @@ async def _run_nvidia_pipeline(prompt: str) -> dict:
                 backend = get_storage_backend()
                 asset_url = backend.put(asset_key, io.BytesIO(image_bytes), content_type="image/png")
 
-                manifest_data = {
+                manifest_data = sign_manifest({
                     "run_id": run_id,
                     "provider": "nvidia",
                     "model": model_name,
@@ -268,7 +311,7 @@ async def _run_nvidia_pipeline(prompt: str) -> dict:
                     "has_embedded_metadata": False,
                     "has_visible_label": False,
                     "has_machine_readable_mark": False,
-                }
+                })
                 manifest_uri = backend.put(
                     manifest_key,
                     io.BytesIO(json.dumps(manifest_data, indent=2).encode()),
@@ -324,13 +367,13 @@ async def _run_pollinations_pipeline(prompt: str) -> dict:
     backend = get_storage_backend()
     asset_url = backend.put(asset_key, io.BytesIO(image_bytes), content_type=content_type)
 
-    manifest_data = {
+    manifest_data = sign_manifest({
         "run_id": run_id, "provider": "pollinations", "model": POLLINATIONS_MODEL,
         "prompt": prompt, "modality": "image",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "assets": [{"key": asset_key, "url": asset_url, "sha256": sha256, "mime_type": content_type}],
         "has_embedded_metadata": False, "has_visible_label": False, "has_machine_readable_mark": False,
-    }
+    })
     manifest_uri = backend.put(
         manifest_key, io.BytesIO(json.dumps(manifest_data, indent=2).encode()),
         content_type="application/json",
@@ -423,11 +466,12 @@ async def run_video_pipeline(prompt: str, api_keys: list[str] | None = None) -> 
                     logger.warning("Veo execution error: %s — falling back", e)
                     break
 
-    # Fallback for video generation if Veo quota is unavailable
-    logger.warning("Veo unavailable — executing image pipeline fallback for video request")
-    res = await run_image_pipeline(prompt, api_keys=api_keys)
-    res["modality"] = "video"
-    return res
+    # Veo is unavailable. Raise a clear error rather than returning an image
+    # mislabeled as video — that would corrupt the manifest and break the <video> tag.
+    raise RuntimeError(
+        "Video generation unavailable: Google Veo quota exhausted and no video fallback provider is configured. "
+        "Please try image generation instead, or retry later when Veo quota refreshes."
+    )
 
 
 async def run_remix_pipeline(
