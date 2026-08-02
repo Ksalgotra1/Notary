@@ -5,6 +5,7 @@ import StatusBadge from '../components/StatusBadge';
 import ManifestPanel from '../components/ManifestPanel';
 import ComplianceCard from '../components/ComplianceCard';
 import ForensicReport from '../components/ForensicReport';
+import LineageGraph from '../components/LineageGraph';
 
 export default function AssetPage() {
   const { runId } = useParams();
@@ -150,6 +151,14 @@ export default function AssetPage() {
           <button className="btn btn-secondary" onClick={() => setShowBadge(true)}>
             🛡️ Embed Badge
           </button>
+          <a
+            className="btn btn-secondary"
+            href={`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/assets/${runId}/certificate`}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            📜 Download Certificate
+          </a>
         </div>
       </div>
 
@@ -239,6 +248,11 @@ export default function AssetPage() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Lineage DAG */}
+      <div style={{ marginTop: 24 }}>
+        <LineageGraph runId={runId} />
       </div>
 
       {/* Remix Modal */}

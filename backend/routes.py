@@ -6,10 +6,11 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi.responses import StreamingResponse
 from aiosqlite import Connection
 
-from cache import get_db, get_asset, list_assets, insert_asset, update_verify_status, update_compliance
+from cache import get_db, get_asset, list_assets, insert_asset, update_verify_status, update_compliance, get_lineage
 from compliance import evaluate_asset, manifest_data_from_db_row
 from models import (
     AssetDetail, AssetListResponse, AssetSummary,
@@ -463,4 +464,272 @@ async def provenance_badge(run_id: str, db: Connection = Depends(get_db)):
         content=svg,
         media_type="image/svg+xml",
         headers={"Cache-Control": "no-cache, max-age=0"},
+    )
+
+
+# ── Provenance Lineage DAG ────────────────────────────────────────
+
+@router.get("/assets/{run_id}/lineage")
+async def get_asset_lineage(run_id: str, db: Connection = Depends(get_db)):
+    """
+    Add-on: Return the full provenance lineage DAG for an asset.
+    Walks parent_run_id upward to root and downward to all descendants.
+    Returns nodes (assets) and edges (parent→child) for graph rendering.
+    """
+    row = await get_asset(db, run_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    lineage = await get_lineage(db, run_id)
+    return lineage
+
+
+# ── Real-Time SSE Generation Stream ──────────────────────────────
+
+import asyncio
+import json as json_mod
+
+
+@router.post("/generate/stream")
+async def generate_stream(req: GenerateRequest, db: Connection = Depends(get_db)):
+    """
+    Add-on: Server-Sent Events stream that reports real-time cascade progress.
+    The client receives events like:
+      data: {"stage": "trying_google", "message": "Trying Google Genblaze..."}
+      data: {"stage": "google_quota_error", "message": "Google quota exhausted, rotating..."}
+      data: {"stage": "trying_nvidia", "message": "Trying NVIDIA NIM..."}
+      data: {"stage": "completed", "run_id": "abc123", "asset_url": "..."}
+    """
+    async def event_stream():
+        import pipeline as pl
+
+        t0 = time.monotonic()
+        stages = []
+
+        def emit(stage: str, message: str, **extra):
+            event = {"stage": stage, "message": message, "elapsed_ms": int((time.monotonic() - t0) * 1000), **extra}
+            stages.append(event)
+            return f"data: {json_mod.dumps(event)}\n\n"
+
+        # --- Try Google ---
+        keys = pl.load_google_keys()
+        if keys and req.modality.value == "image":
+            yield emit("trying_google", "Attempting Google Genblaze pipeline...")
+            try:
+                multi = pl.MultiKeyGoogleProvider(keys, pl._get_google_image_provider_class())
+                while True:
+                    provider = multi.get_provider()
+                    try:
+                        from genblaze_core import Pipeline, Modality
+                        storage = pl.get_b2_storage()
+                        run, manifest = await (
+                            Pipeline("notary-image-generate")
+                            .step(provider, model=pl.IMAGE_MODEL_ID, prompt=req.prompt, modality=Modality.IMAGE)
+                            .arun(sink=storage, timeout=120)
+                        )
+                        asset = run.steps[0].assets[0]
+                        res = {
+                            "run_id": run.run_id, "asset_url": asset.url,
+                            "manifest_uri": manifest.manifest_uri, "sha256": asset.sha256,
+                            "provider": "google", "model": pl.IMAGE_MODEL_ID,
+                            "has_embedded_metadata": True, "has_visible_label": False,
+                            "has_machine_readable_mark": False,
+                        }
+                        yield emit("google_success", f"Google succeeded (model: {pl.IMAGE_MODEL_ID})")
+                        # Save to DB and emit completion
+                        latency_ms = int((time.monotonic() - t0) * 1000)
+                        await record_generation(run_id=res["run_id"], provider="google", model=pl.IMAGE_MODEL_ID,
+                                                modality="image", success=True, latency_ms=latency_ms)
+                        await _save_asset_to_db(db, req, res)
+                        yield emit("completed", "Generation complete!", **res)
+                        return
+                    except Exception as e:
+                        if pl._is_quota_error(e):
+                            yield emit("google_quota_error", f"Google key {multi.current_key_index} quota exhausted, rotating...")
+                            if not multi.advance():
+                                yield emit("google_exhausted", "All Google API keys exhausted.")
+                                break
+                        else:
+                            yield emit("google_error", f"Google failed: {str(e)[:80]}")
+                            break
+            except Exception as e:
+                yield emit("google_error", f"Google setup failed: {str(e)[:80]}")
+
+        # --- Try NVIDIA NIM ---
+        nv_key = os.getenv("NVIDIA_API_KEY", "")
+        if nv_key and req.modality.value == "image":
+            yield emit("trying_nvidia", "Attempting NVIDIA NIM pipeline...")
+            try:
+                res = await pl._run_nvidia_pipeline(req.prompt)
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                await record_generation(run_id=res["run_id"], provider="nvidia", model=res["model"],
+                                        modality="image", success=True, latency_ms=latency_ms)
+                yield emit("nvidia_success", f"NVIDIA succeeded (model: {res['model']})")
+                await _save_asset_to_db(db, req, res)
+                yield emit("completed", "Generation complete!", **res)
+                return
+            except Exception as e:
+                yield emit("nvidia_error", f"NVIDIA failed: {str(e)[:80]}")
+
+        # --- Pollinations fallback ---
+        yield emit("trying_pollinations", "Falling back to Pollinations.ai (always available)...")
+        try:
+            res = await pl._run_pollinations_pipeline(req.prompt)
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            await record_generation(run_id=res["run_id"], provider="pollinations", model=res["model"],
+                                    modality="image", success=True, latency_ms=latency_ms)
+            yield emit("pollinations_success", f"Pollinations succeeded (model: {res['model']})")
+            await _save_asset_to_db(db, req, res)
+            yield emit("completed", "Generation complete!", **res)
+        except Exception as e:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            await record_generation(run_id=None, provider="unknown", model="unknown",
+                                    modality=req.modality.value, success=False,
+                                    latency_ms=latency_ms, error_type=type(e).__name__)
+            yield emit("failed", f"All providers failed: {str(e)[:120]}")
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+import os
+
+
+async def _save_asset_to_db(db, req, res):
+    """Helper to persist a generation result to the SQLite cache."""
+    created_at = datetime.now(timezone.utc).isoformat()
+    row = {
+        "run_id": res["run_id"],
+        "parent_run_id": res.get("parent_run_id"),
+        "provider": res.get("provider", "google"),
+        "model": res.get("model", "unknown"),
+        "modality": req.modality.value,
+        "prompt": req.prompt,
+        "b2_asset_url": res["asset_url"],
+        "b2_manifest_url": res["manifest_uri"],
+        "sha256": res["sha256"],
+        "created_at": created_at,
+        "last_verified_at": None,
+        "verify_status": None,
+        "has_embedded_metadata": 1 if res.get("has_embedded_metadata") else 0,
+        "has_visible_label": 1 if res.get("has_visible_label") else 0,
+        "has_machine_readable_mark": 1 if res.get("has_machine_readable_mark") else 0,
+        "has_audio_disclosure": 0,
+        "compliance_evaluated_at": None,
+        "india_compliant": None,
+        "eu_compliant": None,
+    }
+    await insert_asset(db, row)
+
+
+# ── Provenance Certificate ───────────────────────────────────────
+
+@router.get("/assets/{run_id}/certificate", response_class=Response)
+async def provenance_certificate(run_id: str, db: Connection = Depends(get_db)):
+    """
+    Add-on: Return a downloadable HTML provenance certificate.
+    Self-contained, print-friendly, with QR code link placeholder.
+    """
+    row = await get_asset(db, run_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    manifest = manifest_data_from_db_row(row)
+    report = evaluate_asset(manifest)
+    india = report["regulations"][0]
+    eu = report["regulations"][1]
+
+    verify_url = f"https://notary.app/verify/{run_id}"
+    created_dt = row["created_at"]
+    sha_short = row["sha256"][:16] + "..."
+
+    india_checks_html = ""
+    for c in india["checks"]:
+        icon = "✅" if c["status"] == "pass" else "⚠️" if c["status"] == "partial" else "⬜" if c["status"] == "not_applicable" else "❌"
+        india_checks_html += f'<tr><td>{icon}</td><td>{c["requirement_id"]}</td><td>{c["description"]}</td><td><b>{c["status"].upper()}</b></td></tr>'
+
+    eu_checks_html = ""
+    for c in eu["checks"]:
+        icon = "✅" if c["status"] == "pass" else "⚠️" if c["status"] == "partial" else "❌"
+        eu_checks_html += f'<tr><td>{icon}</td><td>{c["requirement_id"]}</td><td>{c["description"]}</td><td><b>{c["status"].upper()}</b></td></tr>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Notary Provenance Certificate — {run_id[:8]}</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: 'Inter', sans-serif; background: #0a0a12; color: #e8e8f0; padding: 40px; }}
+  .cert {{ max-width: 800px; margin: 0 auto; background: linear-gradient(135deg, #12121e 0%, #1a1a2e 100%);
+           border: 1px solid rgba(99,102,241,0.3); border-radius: 16px; padding: 48px; position: relative; overflow: hidden; }}
+  .cert::before {{ content: ''; position: absolute; top: -2px; left: -2px; right: -2px; bottom: -2px;
+                   background: linear-gradient(135deg, #6366f1, #3b82f6, #6366f1); border-radius: 17px; z-index: -1; }}
+  .header {{ text-align: center; margin-bottom: 32px; }}
+  .header h1 {{ font-size: 28px; font-weight: 800; background: linear-gradient(135deg, #6366f1, #3b82f6);
+               -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
+  .header .subtitle {{ color: #888; font-size: 13px; margin-top: 4px; }}
+  .shield {{ font-size: 48px; margin-bottom: 12px; }}
+  .section {{ margin: 24px 0; }}
+  .section h2 {{ font-size: 15px; font-weight: 700; color: #6366f1; text-transform: uppercase;
+                 letter-spacing: 1.5px; margin-bottom: 12px; border-bottom: 1px solid rgba(99,102,241,0.2); padding-bottom: 6px; }}
+  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
+  .field {{ background: rgba(255,255,255,0.04); border-radius: 8px; padding: 12px; }}
+  .field .label {{ font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 1px; }}
+  .field .value {{ font-size: 14px; font-weight: 600; margin-top: 4px; word-break: break-all; }}
+  .field.full {{ grid-column: 1 / -1; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+  table th {{ text-align: left; color: #888; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.08); }}
+  table td {{ padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); }}
+  .score {{ display: inline-block; background: linear-gradient(135deg, #6366f1, #3b82f6); color: #fff;
+            font-size: 20px; font-weight: 800; padding: 4px 16px; border-radius: 8px; }}
+  .footer {{ text-align: center; margin-top: 32px; font-size: 11px; color: #555; }}
+  .footer a {{ color: #6366f1; }}
+  @media print {{ body {{ background: #fff; color: #222; }} .cert {{ border: 2px solid #6366f1; }} }}
+</style>
+</head>
+<body>
+<div class="cert">
+  <div class="header">
+    <div class="shield">🛡️</div>
+    <h1>Notary — Provenance Certificate</h1>
+    <div class="subtitle">Immutable AI Content Provenance &amp; Regulatory Compliance Record</div>
+  </div>
+
+  <div class="section">
+    <h2>Asset Identity</h2>
+    <div class="grid">
+      <div class="field"><div class="label">Run ID</div><div class="value" style="font-family:monospace;font-size:12px">{run_id}</div></div>
+      <div class="field"><div class="label">Created At</div><div class="value">{created_dt}</div></div>
+      <div class="field"><div class="label">AI Provider</div><div class="value">{row['provider']}</div></div>
+      <div class="field"><div class="label">Model</div><div class="value">{row['model']}</div></div>
+      <div class="field full"><div class="label">Original Prompt</div><div class="value">{row['prompt']}</div></div>
+      <div class="field full"><div class="label">SHA-256 Fingerprint</div><div class="value" style="font-family:monospace;font-size:11px">{row['sha256']}</div></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>India IT Rules 2026 — SGI Compliance <span class="score">{india['passed']}/{india['total']}</span></h2>
+    <table><thead><tr><th></th><th>Rule</th><th>Description</th><th>Status</th></tr></thead><tbody>{india_checks_html}</tbody></table>
+  </div>
+
+  <div class="section">
+    <h2>EU AI Act Article 50 <span class="score">{eu['passed']}/{eu['total']}</span></h2>
+    <table><thead><tr><th></th><th>Rule</th><th>Description</th><th>Status</th></tr></thead><tbody>{eu_checks_html}</tbody></table>
+  </div>
+
+  <div class="footer">
+    <p>This certificate was generated by <b>Notary</b> — an immutable provenance engine powered by Backblaze B2 &amp; Genblaze.</p>
+    <p>Verify this asset at: <a href="{verify_url}">{verify_url}</a></p>
+    <p style="margin-top:8px;color:#444">Certificate generated at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
+  </div>
+</div>
+</body>
+</html>"""
+
+    return Response(
+        content=html,
+        media_type="text/html",
+        headers={
+            "Content-Disposition": f'inline; filename="notary-certificate-{run_id[:8]}.html"',
+        },
     )

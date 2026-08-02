@@ -127,3 +127,77 @@ async def update_compliance(
         (int(india_compliant), int(eu_compliant), evaluated_at, run_id),
     )
     await db.commit()
+
+
+async def get_lineage(db: aiosqlite.Connection, run_id: str) -> dict:
+    """
+    Walk the parent_run_id chain up to the root AND down to all children,
+    returning the full provenance DAG as a list of nodes and edges.
+    """
+    nodes = {}
+    edges = []
+
+    # Walk UP to root
+    current = run_id
+    while current:
+        if current in nodes:
+            break
+        async with db.execute("SELECT * FROM assets WHERE run_id = ?", (current,)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                break
+            row = dict(row)
+            nodes[current] = {
+                "run_id": current,
+                "prompt": row["prompt"],
+                "provider": row["provider"],
+                "model": row["model"],
+                "modality": row["modality"],
+                "created_at": row["created_at"],
+                "verify_status": row["verify_status"],
+                "b2_asset_url": row["b2_asset_url"],
+            }
+            parent = row.get("parent_run_id")
+            if parent:
+                edges.append({"source": parent, "target": current})
+            current = parent
+
+    # Walk DOWN: find all descendants
+    queue = [run_id]
+    while queue:
+        parent_id = queue.pop(0)
+        async with db.execute(
+            "SELECT * FROM assets WHERE parent_run_id = ?", (parent_id,)
+        ) as cur:
+            children = await cur.fetchall()
+            for child in children:
+                child = dict(child)
+                cid = child["run_id"]
+                if cid not in nodes:
+                    nodes[cid] = {
+                        "run_id": cid,
+                        "prompt": child["prompt"],
+                        "provider": child["provider"],
+                        "model": child["model"],
+                        "modality": child["modality"],
+                        "created_at": child["created_at"],
+                        "verify_status": child["verify_status"],
+                        "b2_asset_url": child["b2_asset_url"],
+                    }
+                    edges.append({"source": parent_id, "target": cid})
+                    queue.append(cid)
+
+    # Find root (node with no incoming edge)
+    targets = {e["target"] for e in edges}
+    root = None
+    for nid in nodes:
+        if nid not in targets:
+            root = nid
+            break
+
+    return {
+        "root": root or run_id,
+        "nodes": list(nodes.values()),
+        "edges": edges,
+        "total_nodes": len(nodes),
+    }

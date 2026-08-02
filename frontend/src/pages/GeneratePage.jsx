@@ -3,6 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import StatusBadge from '../components/StatusBadge';
 
+const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
 export default function GeneratePage() {
   const [prompt, setPrompt] = useState('');
   const [modality, setModality] = useState('image');
@@ -10,6 +12,7 @@ export default function GeneratePage() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [genTime, setGenTime] = useState(null);
+  const [cascadeLog, setCascadeLog] = useState([]);
   const navigate = useNavigate();
 
   const handleGenerate = async (e) => {
@@ -20,25 +23,61 @@ export default function GeneratePage() {
     setError(null);
     setResult(null);
     setGenTime(null);
+    setCascadeLog([]);
     const t0 = performance.now();
 
     try {
-      const res = await api.post('/generate', {
-        prompt,
-        modality,
+      // Use SSE streaming endpoint for real-time cascade visibility
+      const response = await fetch(`${BASE_URL}/generate/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, modality }),
       });
-      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-      setGenTime(elapsed);
-      setResult(res.data);
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.detail || `HTTP ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const event = JSON.parse(line.slice(6));
+              setCascadeLog(prev => [...prev, event]);
+
+              if (event.stage === 'completed') {
+                const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+                setGenTime(elapsed);
+                setResult(event);
+              } else if (event.stage === 'failed') {
+                setError(event.message);
+              }
+            } catch (parseErr) {
+              // skip malformed events
+            }
+          }
+        }
+      }
     } catch (err) {
       console.error(err);
-      setError(
-        err.response?.data?.detail || 'Failed to generate asset. Please try again.'
-      );
+      setError(err.message || 'Failed to generate asset. Please try again.');
     } finally {
       setLoading(false);
     }
   };
+
 
   return (
     <div className="page">
@@ -116,6 +155,35 @@ export default function GeneratePage() {
               <h3>Generation Error</h3>
               <p>{error}</p>
             </div>
+          </div>
+        )}
+
+        {/* Live Cascade Log */}
+        {cascadeLog.length > 0 && (
+          <div style={{
+            marginTop: 16, background: 'rgba(0,0,0,0.3)', borderRadius: 10,
+            padding: 16, fontFamily: 'monospace', fontSize: 12, maxHeight: 200,
+            overflowY: 'auto',
+          }}>
+            <div style={{ fontSize: 10, color: '#888', marginBottom: 8, fontFamily: 'Inter, sans-serif', fontWeight: 600 }}>
+              🔀 PROVIDER CASCADE LOG
+            </div>
+            {cascadeLog.map((ev, i) => {
+              const icon = ev.stage.includes('success') || ev.stage === 'completed' ? '✅'
+                : ev.stage.includes('error') || ev.stage.includes('exhausted') || ev.stage === 'failed' ? '❌'
+                : ev.stage.includes('trying') ? '🔄'
+                : ev.stage.includes('quota') ? '⚠️' : '•';
+              const color = ev.stage.includes('success') || ev.stage === 'completed' ? '#2ea44f'
+                : ev.stage.includes('error') || ev.stage === 'failed' ? '#d73a49'
+                : '#e3a008';
+              return (
+                <div key={i} style={{ marginBottom: 3, display: 'flex', gap: 8, color }}>
+                  <span>{icon}</span>
+                  <span style={{ color: '#555', minWidth: 55 }}>{ev.elapsed_ms}ms</span>
+                  <span>{ev.message}</span>
+                </div>
+              );
+            })}
           </div>
         )}
 
