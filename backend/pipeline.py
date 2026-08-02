@@ -1,531 +1,567 @@
-"""
-Genblaze pipeline integration + provider cascade.
+"""Genblaze-first media generation and B2 provenance storage.
 
-Provider cascade for image generation:
-  1. GeminiImageProvider (Google) — best quality, requires Pro/billing
-  2. NvidiaImageProvider (NVIDIA NIM) — high quality, fast (FLUX.1-schnell)
-  3. Pollinations.ai (FLUX) — free, zero-auth, final fallback
-
-The cascade tries providers in order, rotating keys on quota errors.
-B2 storage via genblaze-s3 is used for all paths.
+Every supported provider executes through ``genblaze_core.Pipeline`` and
+``ObjectStorageSink``. The sink writes the asset and canonical Genblaze
+manifest to Backblaze B2; manifests can be protected with B2 File Lock.
 """
-import hashlib
-import hmac
-import io
-import json
+from __future__ import annotations
+
 import logging
 import os
+import json
+import hashlib
+import base64
+import mimetypes
+import tempfile
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
 import asyncio
-import httpx
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from genblaze_core.exceptions import ProviderError
+from genblaze_core.models.asset import Asset
+from genblaze_core.models.enums import Modality
+from genblaze_core.models.step import Step
+from genblaze_core.providers.base import ProviderCapabilities, SyncProvider
+from genblaze_core.runnable.config import RunnableConfig
 
 logger = logging.getLogger(__name__)
 
-# ── Confirmed via discovery + model probe ─────────────────────────────────
-IMAGE_PROVIDER_CLASS_NAME = "GeminiImageProvider"       # genblaze_google
-VIDEO_PROVIDER_CLASS_NAME = "VeoProvider"               # genblaze_google
-IMAGE_MODEL_ID = "gemini-2.5-flash-image"               # confirmed via models.known()
-VIDEO_MODEL_ID = "veo-3.0-generate-001"                 # confirmed via models.known()
-
-# NVIDIA NIM fallback models
-NVIDIA_IMAGE_MODEL_PRIMARY = "black-forest-labs/flux-1-schnell"
-NVIDIA_IMAGE_MODEL_SECONDARY = "stabilityai/stable-diffusion-3-5-large"
-
-# Pollinations.ai fallback (free, no auth, no card, always works)
-POLLINATIONS_MODEL = "flux"
-POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
-LOCAL_GENERATED_DIR = Path(__file__).resolve().parent / "generated"
-
-# ── Manifest signing ─────────────────────────────────────────────────────────
-# Server-side HMAC secret — set MANIFEST_SIGNING_SECRET in .env for production.
-# Without this, anyone with B2 write access could forge a manifest.
-MANIFEST_SIGNING_SECRET = os.getenv("MANIFEST_SIGNING_SECRET", "notary-dev-secret-change-in-prod")
+IMAGE_MODEL_ID = "gemini-2.5-flash-image"
+VIDEO_MODEL_ID = "veo-3.0-generate-001"
+NVIDIA_IMAGE_MODEL_PRIMARY = "black-forest-labs/flux.1-schnell"
+HF_SPACE_ID = "black-forest-labs/FLUX.2-klein-4B"
+HF_SPACE_MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
+POLLINATIONS_IMAGE_MODEL = "flux"
 
 
-def sign_manifest(manifest_data: dict) -> dict:
+class HuggingFaceSpaceImageProvider(SyncProvider):
+    """Run the public FLUX.2 Klein Space through Genblaze.
+
+    ``HF_TOKEN`` is optional for a public Space. When supplied, it is only
+    sent to Hugging Face as transport authentication; it is never recorded in
+    the Genblaze step payload or provenance manifest.
     """
-    Add an HMAC-SHA256 signature to a manifest dict.
-    The signature covers all fields except _signature itself,
-    computed over the JSON body sorted by key for determinism.
-    """
-    # Strip any existing signature before signing
-    payload = {k: v for k, v in manifest_data.items() if k != "_signature"}
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    sig = hmac.new(MANIFEST_SIGNING_SECRET.encode(), canonical, hashlib.sha256).hexdigest()
-    return {**manifest_data, "_signature": sig}
+
+    name = "huggingface-space"
+
+    def __init__(self, *, space_id: str, token: str | None, timeout_seconds: float) -> None:
+        super().__init__()
+        self._space_id = space_id
+        self._token = token
+        self._timeout_seconds = timeout_seconds
+
+    def get_capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            supported_modalities=[Modality.IMAGE],
+            supported_inputs=["text"],
+            models=[HF_SPACE_MODEL_ID],
+            output_formats=["image/png", "image/jpeg", "image/webp"],
+        )
+
+    def generate(self, step: Step, config: RunnableConfig | None = None) -> Step:
+        try:
+            from gradio_client import Client
+
+            client = Client(
+                self._space_id,
+                token=self._token or None,
+                verbose=False,
+                httpx_kwargs={"timeout": self._timeout_seconds},
+            )
+            result = client.predict(
+                step.prompt or "",
+                [],
+                "Distilled (4 steps)",
+                0,
+                True,
+                1024,
+                1024,
+                4,
+                1.0,
+                False,
+                api_name="/infer",
+            )
+            image_result = result[0] if isinstance(result, (list, tuple)) else result
+            source = image_result.get("path") if isinstance(image_result, dict) else str(image_result)
+            image_bytes = Path(source).read_bytes()
+            if not image_bytes:
+                raise ValueError("Space returned an empty image file")
+            suffix = Path(source).suffix or ".png"
+            media_type = mimetypes.guess_type(source)[0] or "image/png"
+            handle, destination = tempfile.mkstemp(prefix="notary-hf-space-", suffix=suffix)
+            os.close(handle)
+            Path(destination).write_bytes(image_bytes)
+        except Exception as exc:
+            raise ProviderError(f"Hugging Face Space image generation failed: {exc}") from exc
+
+        # Only operational, non-secret details are preserved in provenance.
+        step.provider_payload = {
+            "huggingface_space": {"space_id": self._space_id, "authenticated": bool(self._token)}
+        }
+        step.assets.append(Asset(url=Path(destination).as_uri(), media_type=media_type))
+        return step
 
 
-def verify_manifest_signature(manifest_data: dict) -> bool:
-    """
-    Verify the HMAC-SHA256 signature on a manifest.
-    Returns True if signature is valid, False otherwise.
-    """
-    expected_sig = manifest_data.get("_signature")
-    if not expected_sig:
-        return False
-    payload = {k: v for k, v in manifest_data.items() if k != "_signature"}
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    actual_sig = hmac.new(MANIFEST_SIGNING_SECRET.encode(), canonical, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected_sig, actual_sig)
+class PollinationsImageProvider(SyncProvider):
+    """Genblaze adapter for Pollinations' authenticated image API."""
 
+    name = "pollinations"
+
+    def __init__(self, *, api_key: str, timeout_seconds: float) -> None:
+        super().__init__()
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+
+    def get_capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            supported_modalities=[Modality.IMAGE],
+            supported_inputs=["text"],
+            models=[POLLINATIONS_IMAGE_MODEL],
+            output_formats=["image/png", "image/jpeg", "image/webp"],
+        )
+
+    def generate(self, step: Step, config: RunnableConfig | None = None) -> Step:
+        try:
+            import httpx
+
+            response = httpx.post(
+                "https://gen.pollinations.ai/v1/images/generations",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json={
+                    "model": step.model,
+                    "prompt": step.prompt or "",
+                    "n": 1,
+                    "size": "1024x1024",
+                    "response_format": "b64_json",
+                },
+                timeout=self._timeout_seconds,
+            )
+            response.raise_for_status()
+            item = response.json()["data"][0]
+            encoded = item.get("b64_json")
+            if not encoded:
+                raise ValueError("Pollinations response did not contain b64_json output")
+            image_bytes = base64.b64decode(encoded, validate=True)
+            if not image_bytes:
+                raise ValueError("Pollinations returned an empty image")
+            handle, destination = tempfile.mkstemp(prefix="notary-pollinations-", suffix=".png")
+            os.close(handle)
+            Path(destination).write_bytes(image_bytes)
+        except Exception as exc:
+            raise ProviderError(f"Pollinations image generation failed: {exc}") from exc
+
+        step.provider_payload = {"pollinations": {"model": step.model, "status": "succeeded"}}
+        step.assets.append(Asset(url=Path(destination).as_uri(), media_type="image/png"))
+        return step
+
+
+class StorageConfigurationError(RuntimeError):
+    """Raised when immutable B2 storage is not configured for a run."""
 
 
 class MultiKeyGoogleProvider:
-    """
-    Cross-account key rotation for Google AI Pro.
-
-    Genblaze's fallback_models retries across *models* within one account.
-    This wrapper rotates across *accounts* (separate GEMINI_API_KEYs) on quota errors.
-    """
+    """Rotate separate Google accounts only when a quota/rate limit is hit."""
 
     def __init__(self, api_keys: list[str], provider_cls):
-        if not api_keys:
-            raise ValueError("MultiKeyGoogleProvider: no API keys provided")
-        self._keys = [k.strip() for k in api_keys if k.strip()]
+        self._keys = [key.strip() for key in api_keys if key.strip()]
+        if not self._keys:
+            raise ValueError("At least one Google API key is required")
         self._provider_cls = provider_cls
         self._idx = 0
-        logger.info("MultiKeyGoogleProvider: %d keys loaded", len(self._keys))
 
     def get_provider(self):
         return self._provider_cls(api_key=self._keys[self._idx])
 
     def advance(self) -> bool:
         self._idx += 1
-        if self._idx >= len(self._keys):
-            logger.error("MultiKeyGoogleProvider: all %d keys exhausted", len(self._keys))
-            return False
-        logger.warning(
-            "MultiKeyGoogleProvider: rotating to key %d/%d",
-            self._idx + 1, len(self._keys),
-        )
-        return True
-
-    def reset(self) -> None:
-        self._idx = 0
+        return self._idx < len(self._keys)
 
     @property
     def current_key_index(self) -> int:
         return self._idx
 
-    @property
-    def keys_remaining(self) -> int:
-        return len(self._keys) - self._idx
-
 
 def load_google_keys() -> list[str]:
-    raw = os.getenv("GOOGLE_API_KEYS", "")
-    keys = [k.strip() for k in raw.split(",") if k.strip()]
-    if not keys:
-        logger.warning("No GOOGLE_API_KEYS found in environment")
-    return keys
+    return [key.strip() for key in os.getenv("GOOGLE_API_KEYS", "").split(",") if key.strip()]
 
 
-def get_b2_storage():
-    """Build an ObjectStorageSink pointing at the notary-media B2 bucket."""
-    from genblaze_core import ObjectStorageSink, KeyStrategy
-    from genblaze_s3 import S3StorageBackend
-    # NOTE: for_backblaze takes bucket as first positional arg, rest as kwargs
-    backend = S3StorageBackend.for_backblaze(
-        os.getenv("B2_BUCKET_NAME", "notary-media"),
-        region=os.getenv("B2_REGION", "us-east-005"),
-        key_id=os.getenv("B2_KEY_ID"),
-        app_key=os.getenv("B2_APP_KEY"),
-    )
-    return ObjectStorageSink(
-        backend,
-        key_strategy=KeyStrategy.HIERARCHICAL,
-    )
+def _is_quota_error(exc: Exception) -> bool:
+    message = f"{type(exc).__name__} {exc}".lower()
+    return any(token in message for token in ("quota", "rate limit", "ratelimit", "429", "resource exhausted"))
+
+
+def _require_b2_configuration() -> None:
+    missing = [name for name in ("B2_KEY_ID", "B2_APP_KEY", "B2_BUCKET_NAME") if not os.getenv(name)]
+    if missing:
+        raise StorageConfigurationError(
+            "B2 is required for Notary generation. Configure " + ", ".join(missing) + "."
+        )
+    if os.getenv("B2_OBJECT_LOCK_ENABLED", "true").lower() not in {"1", "true", "yes", "on"}:
+        raise StorageConfigurationError(
+            "B2_OBJECT_LOCK_ENABLED must be true. Create the B2 bucket with File Lock enabled."
+        )
 
 
 def get_b2_backend():
-    """Return the raw S3StorageBackend for manual uploads."""
+    """Create the Genblaze B2 backend; no local durable-storage fallback exists."""
+    _require_b2_configuration()
     from genblaze_s3 import S3StorageBackend
+
     return S3StorageBackend.for_backblaze(
-        os.getenv("B2_BUCKET_NAME", "notary-media"),
+        os.environ["B2_BUCKET_NAME"],
         region=os.getenv("B2_REGION", "us-east-005"),
-        key_id=os.getenv("B2_KEY_ID"),
-        app_key=os.getenv("B2_APP_KEY"),
+        key_id=os.environ["B2_KEY_ID"],
+        app_key=os.environ["B2_APP_KEY"],
+        public_url_base=os.getenv("B2_PUBLIC_URL_BASE") or None,
+        auto_lifecycle=os.getenv("B2_AUTO_LIFECYCLE", "false").lower() in {"1", "true", "yes", "on"},
+        preflight=True,
     )
-
-
-class LocalStorageBackend:
-    """Local dev storage used when B2/genblaze-s3 is not configured."""
-
-    def put(self, key: str, body, content_type: str | None = None) -> str:
-        path = LOCAL_GENERATED_DIR / key
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = body.read() if hasattr(body, "read") else body
-        path.write_bytes(data)
-        return f"http://localhost:8000/generated/{key.replace(os.sep, '/')}"
-
-    def get(self, key: str) -> bytes:
-        return (LOCAL_GENERATED_DIR / key).read_bytes()
-
-
-_cached_backend = None
 
 
 def get_storage_backend():
-    """
-    Prefer B2; fall back to local files so the site remains testable.
-    Cached as a module-level singleton — instantiated once, reused across all requests.
-    Catches: missing module, missing/wrong credentials, bucket not found.
-    """
-    global _cached_backend
-    if _cached_backend is not None:
-        return _cached_backend
-    try:
-        backend = get_b2_backend()
-        logger.info("B2 storage backend connected (bucket=%s)", os.getenv("B2_BUCKET_NAME"))
-        _cached_backend = backend
-    except Exception as e:
-        logger.warning("B2 backend unavailable (%s: %s); using local generated storage",
-                       type(e).__name__, e)
-        _cached_backend = LocalStorageBackend()
-    return _cached_backend
+    """Compatibility name for operational modules; always returns B2."""
+    return get_b2_backend()
 
 
-def _is_quota_error(e: Exception) -> bool:
-    """Detect quota/rate-limit errors by type name + message."""
-    err_type = type(e).__name__.lower()
-    err_msg = str(e).lower()
-    quota_keywords = ("quota", "ratelimit", "rate_limit", "resource", "429", "exhausted")
-    return any(kw in err_type for kw in quota_keywords) or \
-           any(kw in err_msg for kw in ("quota", "rate limit", "429", "resource exhausted"))
+def get_b2_storage():
+    """Build a Genblaze sink with hierarchical keys and manifest retention."""
+    from genblaze_core import KeyStrategy, ObjectStorageSink
+    from genblaze_core.storage.base import ObjectLockConfig
 
+    retention_days = int(os.getenv("B2_MANIFEST_RETENTION_DAYS", "365"))
+    if retention_days < 1:
+        raise StorageConfigurationError("B2_MANIFEST_RETENTION_DAYS must be at least 1")
+    mode = os.getenv("B2_OBJECT_LOCK_MODE", "GOVERNANCE").upper()
+    if mode not in {"GOVERNANCE", "COMPLIANCE"}:
+        raise StorageConfigurationError("B2_OBJECT_LOCK_MODE must be GOVERNANCE or COMPLIANCE")
 
-# ── Path A: Google Genblaze Pipeline ─────────────────────────────────────
-
-async def _run_google_pipeline(prompt: str, api_keys: list[str]) -> dict:
-    """
-    Generate image via GeminiImageProvider → Genblaze Pipeline → B2.
-    Rotates across keys on quota errors.
-    """
-    from genblaze_core import Pipeline, Modality
-    from genblaze_google import GeminiImageProvider
-
-    storage = get_b2_storage()
-    multi_key = MultiKeyGoogleProvider(api_keys, GeminiImageProvider)
-
-    last_error = None
-    while True:
-        provider = multi_key.get_provider()
-        try:
-            run, manifest = await (
-                Pipeline("notary-generate")
-                .step(
-                    provider,
-                    model=IMAGE_MODEL_ID,
-                    prompt=prompt,
-                    modality=Modality.IMAGE,
-                )
-                .arun(sink=storage, timeout=120)
-            )
-            steps = getattr(run, "steps", [])
-            assets = getattr(steps[0], "assets", []) if steps else []
-            if not assets:
-                status = getattr(run, "status", "failed")
-                raise RuntimeError(
-                    f"Google image pipeline returned no asset (status={status})"
-                )
-            asset = assets[0]
-            return {
-                "run_id": run.run_id,
-                "asset_url": asset.url,
-                "manifest_uri": manifest.manifest_uri,
-                "sha256": asset.sha256,
-                "provider": "google",
-                "model": IMAGE_MODEL_ID,
-                "has_embedded_metadata": True,
-                "has_visible_label": False,
-                "has_machine_readable_mark": False,
-            }
-        except Exception as e:
-            if _is_quota_error(e):
-                last_error = e
-                logger.warning("Quota on key %d: %s — rotating", multi_key.current_key_index, e)
-                if not multi_key.advance():
-                    raise RuntimeError(f"All Google keys exhausted: {last_error}") from last_error
-            else:
-                raise
-
-
-# ── Path B: NVIDIA NIM + manual B2 upload ─────────────────────────────────
-
-async def _run_nvidia_pipeline(prompt: str) -> dict:
-    """
-    Generate image via NVIDIA NIM (NvidiaImageProvider), upload to B2.
-    Secondary fallback sitting between Google (primary) and Pollinations (final).
-    """
-    from genblaze_nvidia import NvidiaImageProvider
-    from genblaze_core import Modality
-    from genblaze_core.models.step import Step
-
-    nv_key = os.getenv("NVIDIA_API_KEY", "")
-    if not nv_key:
-        raise RuntimeError("NVIDIA_API_KEY not set in environment")
-
-    logger.info("Using NVIDIA NIM fallback (primary model: %s)", NVIDIA_IMAGE_MODEL_PRIMARY)
-
-    provider = NvidiaImageProvider(http_timeout=15.0)
-
-    for model_name in [NVIDIA_IMAGE_MODEL_PRIMARY, NVIDIA_IMAGE_MODEL_SECONDARY]:
-        try:
-            step = Step(
-                provider="nvidia",
-                model=model_name,
-                prompt=prompt,
-                modality=Modality.IMAGE,
-            )
-            res_step = await asyncio.to_thread(provider.invoke, step)
-            if res_step.assets:
-                asset = res_step.assets[0]
-                if hasattr(asset, "data") and asset.data:
-                    image_bytes = asset.data
-                elif hasattr(asset, "path") and asset.path:
-                    with open(asset.path, "rb") as f:
-                        image_bytes = f.read()
-                else:
-                    raise ValueError(f"No bytes or path in NVIDIA asset: {asset}")
-
-                sha256 = hashlib.sha256(image_bytes).hexdigest()
-                run_id = str(uuid.uuid4())
-                date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-                asset_key = f"runs/notary/{date_str}/{run_id}/assets/image.png"
-                manifest_key = f"runs/notary/{date_str}/{run_id}/manifest.json"
-
-                backend = get_storage_backend()
-                asset_url = backend.put(asset_key, io.BytesIO(image_bytes), content_type="image/png")
-
-                manifest_data = sign_manifest({
-                    "run_id": run_id,
-                    "provider": "nvidia",
-                    "model": model_name,
-                    "prompt": prompt,
-                    "modality": "image",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "assets": [{"key": asset_key, "url": asset_url, "sha256": sha256, "mime_type": "image/png"}],
-                    "has_embedded_metadata": False,
-                    "has_visible_label": False,
-                    "has_machine_readable_mark": False,
-                })
-                manifest_uri = backend.put(
-                    manifest_key,
-                    io.BytesIO(json.dumps(manifest_data, indent=2).encode()),
-                    content_type="application/json",
-                )
-
-                logger.info("NVIDIA NIM path success: model=%s asset=%s", model_name, asset_url)
-                return {
-                    "run_id": run_id,
-                    "asset_url": asset_url,
-                    "manifest_uri": manifest_uri,
-                    "sha256": sha256,
-                    "provider": "nvidia",
-                    "model": model_name,
-                    "has_embedded_metadata": False,
-                    "has_visible_label": False,
-                    "has_machine_readable_mark": False,
-                }
-        except Exception as e:
-            err_msg = str(e).lower()
-            if "401" in err_msg or "403" in err_msg or "auth" in err_msg:
-                logger.warning("NVIDIA NIM auth failure (%s): %s", model_name, e)
-                raise
-            logger.warning("NVIDIA NIM model %s failed: %s — trying next", model_name, e)
-
-    raise RuntimeError("All NVIDIA NIM models failed")
-
-
-# ── Path C: Pollinations.ai (free, no auth, always works) ────────────────
-
-async def _run_pollinations_pipeline(prompt: str) -> dict:
-    """Generate image via Pollinations.ai FLUX (free, no auth, no card)."""
-    from urllib.parse import quote
-
-    logger.info("Using Pollinations.ai fallback (%s)", POLLINATIONS_MODEL)
-    url = f"{POLLINATIONS_BASE}/{quote(prompt)}?width=1024&height=1024&nologo=true"
-
-    async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-
-    image_bytes = resp.content
-    content_type = resp.headers.get("content-type", "image/jpeg")
-    ext = "png" if "png" in content_type else "jpeg"
-    sha256 = hashlib.sha256(image_bytes).hexdigest()
-
-    run_id = str(uuid.uuid4())
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    asset_key = f"runs/notary/{date_str}/{run_id}/assets/image.{ext}"
-    manifest_key = f"runs/notary/{date_str}/{run_id}/manifest.json"
-
-    backend = get_storage_backend()
-    asset_url = backend.put(asset_key, io.BytesIO(image_bytes), content_type=content_type)
-
-    manifest_data = sign_manifest({
-        "run_id": run_id, "provider": "pollinations", "model": POLLINATIONS_MODEL,
-        "prompt": prompt, "modality": "image",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "assets": [{"key": asset_key, "url": asset_url, "sha256": sha256, "mime_type": content_type}],
-        "has_embedded_metadata": False, "has_visible_label": False, "has_machine_readable_mark": False,
-    })
-    manifest_uri = backend.put(
-        manifest_key, io.BytesIO(json.dumps(manifest_data, indent=2).encode()),
-        content_type="application/json",
+    return ObjectStorageSink(
+        get_b2_backend(),
+        prefix="notary",
+        key_strategy=KeyStrategy.HIERARCHICAL,
+        manifest_lock=ObjectLockConfig(
+            retain_until=datetime.now(timezone.utc) + timedelta(days=retention_days),
+            mode=mode,
+        ),
+        strict_manifest_reads=True,
     )
 
+
+def _pipeline_result_record(result, *, provider: str, model: str, embedded: bool = False) -> dict:
+    run, manifest = result
+    if not manifest.verify_hash():
+        raise RuntimeError("Genblaze returned a manifest with an invalid canonical hash")
+    assets = [asset for step in run.steps for asset in step.assets]
+    if not assets:
+        raise RuntimeError("Genblaze pipeline completed without an output asset")
+    asset = assets[-1]
+    if not asset.sha256 or not manifest.manifest_uri:
+        raise RuntimeError("Genblaze output is missing a SHA-256 or durable manifest URI")
     return {
-        "run_id": run_id, "asset_url": asset_url, "manifest_uri": manifest_uri,
-        "sha256": sha256, "provider": "pollinations", "model": POLLINATIONS_MODEL,
-        "has_embedded_metadata": False, "has_visible_label": False, "has_machine_readable_mark": False,
+        "run_id": run.run_id,
+        "parent_run_id": run.parent_run_id,
+        "asset_url": asset.url,
+        "manifest_uri": manifest.manifest_uri,
+        "sha256": asset.sha256,
+        "provider": provider,
+        "model": model,
+        "has_embedded_metadata": embedded,
+        "has_visible_label": False,
+        "has_machine_readable_mark": embedded,
+        "manifest_verified": True,
+        "object_lock_enabled": True,
     }
 
 
-# ── Public API: cascade ───────────────────────────────────────────────────
+async def _run_pipeline(provider, *, model: str, prompt: str, modality, parent_result=None, run_metadata: dict | None = None):
+    from genblaze_core import Pipeline
 
-async def run_image_pipeline(prompt: str, api_keys: list[str] | None = None) -> dict:
-    """
-    Generate an image with provider cascade:
-      1. Google GeminiImageProvider (Genblaze Pipeline → B2)  [if keys + quota]
-      2. NVIDIA NIM NvidiaImageProvider (direct → B2)         [if NVIDIA_API_KEY]
-      3. Pollinations.ai FLUX (direct → B2)                    [always available]
-    """
-    keys = api_keys or load_google_keys()
-
-    if keys:
-        try:
-            logger.info("Trying Google path (%d keys)", len(keys))
-            return await _run_google_pipeline(prompt, keys)
-        except Exception as e:
-            if _is_quota_error(e) or "exhausted" in str(e).lower():
-                logger.warning("Google path failed: %s — trying NVIDIA NIM", e)
-            else:
-                logger.warning("Google error (%s: %s) — trying NVIDIA NIM", type(e).__name__, e)
-
-    if os.getenv("NVIDIA_API_KEY"):
-        try:
-            logger.info("Trying NVIDIA NIM path")
-            return await _run_nvidia_pipeline(prompt)
-        except Exception as e:
-            logger.warning("NVIDIA NIM failed: %s — trying Pollinations", e)
-
-    logger.info("Using Pollinations.ai (always available)")
-    return await _run_pollinations_pipeline(prompt)
+    pipeline = Pipeline("notary-generate", preflight=True)
+    if parent_result is not None:
+        pipeline.from_result(parent_result)
+    pipeline.metadata(app="notary", provenance_version="1", **(run_metadata or {}))
+    result = await pipeline.step(
+        provider,
+        model=model,
+        prompt=prompt,
+        modality=modality,
+        metadata={"app": "notary", "provenance_version": "1"},
+    ).arun(sink=get_b2_storage(), timeout=240)
+    return result
 
 
-async def run_video_pipeline(prompt: str, api_keys: list[str] | None = None) -> dict:
-    """
-    Generate a video via Google Veo (VeoProvider) → B2.
-    Falls back to image-pipeline or synthetic MP4 on quota errors.
-    """
-    from genblaze_core import Pipeline, Modality
-    from genblaze_google import VeoProvider
+def _single_output_asset(result):
+    run, manifest = result
+    assets = [asset for step in run.steps for asset in step.assets]
+    if not assets:
+        errors = [str(step.error) for step in run.steps if step.error]
+        detail = f": {' | '.join(errors)}" if errors else ""
+        raise RuntimeError(f"Genblaze pipeline completed without an output asset{detail}")
+    return run, manifest, assets[-1]
 
-    keys = api_keys or load_google_keys()
 
-    if keys:
-        multi_key = MultiKeyGoogleProvider(keys, VeoProvider)
-        while True:
-            provider = multi_key.get_provider()
-            try:
-                logger.info("Trying Google Veo video path (key %d)", multi_key.current_key_index)
-                storage = get_b2_storage()
-                run, manifest = await (
-                    Pipeline("notary-video-generate")
-                    .step(
-                        provider,
-                        model=VIDEO_MODEL_ID,
-                        prompt=prompt,
-                        modality=Modality.VIDEO,
-                    )
-                    .arun(sink=storage, timeout=180)
-                )
-                asset = run.steps[0].assets[0]
-                return {
-                    "run_id": run.run_id,
-                    "asset_url": asset.url,
-                    "manifest_uri": manifest.manifest_uri,
-                    "sha256": asset.sha256,
-                    "provider": "google",
-                    "model": VIDEO_MODEL_ID,
-                    "has_embedded_metadata": True,
-                    "has_visible_label": False,
-                    "has_machine_readable_mark": False,
-                }
-            except Exception as e:
-                if _is_quota_error(e):
-                    logger.warning("Veo quota error on key %d: %s", multi_key.current_key_index, e)
-                    if not multi_key.advance():
-                        break
-                else:
-                    logger.warning("Veo execution error: %s — falling back", e)
-                    break
+async def _create_embedded_receipt(raw_result, *, provider: str, model: str, receipt_run_id: str) -> dict:
+    """Create M1 for the final bytes that carry the immutable M0 manifest."""
+    from genblaze_core import Modality
+    from genblaze_core.media import get_handler
+    from genblaze_core.models.asset import Asset
+    from genblaze_core.models.enums import StepType
+    from genblaze_core.models.manifest import Manifest
+    from genblaze_core.models.run import Run
+    from genblaze_core.models.step import Step
+    from genblaze_core.pipeline.result import PipelineResult
 
-    # Veo is unavailable. Raise a clear error rather than returning an image
-    # mislabeled as video — that would corrupt the manifest and break the <video> tag.
-    raise RuntimeError(
-        "Video generation unavailable: Google Veo quota exhausted and no video fallback provider is configured. "
-        "Please try image generation instead, or retry later when Veo quota refreshes."
+    raw_run, raw_manifest, raw_asset = _single_output_asset(raw_result)
+    if not raw_manifest.verify() or not raw_manifest.manifest_uri:
+        raise RuntimeError("Raw generation manifest is not verifiable or has no durable URI")
+    handler = get_handler(raw_asset.media_type)
+    if handler is None:
+        raise RuntimeError(f"Genblaze has no inline embedding handler for {raw_asset.media_type}")
+
+    backend = get_b2_backend()
+    raw_key = backend.key_from_url(raw_asset.url)
+    if not raw_key:
+        raise RuntimeError("Raw asset URL is not owned by the configured B2 backend")
+    raw_bytes = backend.get(raw_key)
+    suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(raw_asset.media_type)
+    if not suffix:
+        raise RuntimeError(f"Inline embedding is not enabled for {raw_asset.media_type}")
+
+    with tempfile.TemporaryDirectory(prefix="notary-embed-") as directory:
+        path = Path(directory) / f"embedded{suffix}"
+        path.write_bytes(raw_bytes)
+        handler.embed(path, raw_manifest)
+        final_bytes = path.read_bytes()
+        final_sha256 = hashlib.sha256(final_bytes).hexdigest()
+
+        final_asset = Asset(
+            url=path.as_uri(), media_type=raw_asset.media_type,
+            sha256=final_sha256, size_bytes=len(final_bytes),
+            metadata={"embedded_manifest_run_id": raw_run.run_id},
+        )
+        source_step = next(step for step in reversed(raw_run.steps) if step.assets)
+        receipt_step = Step(
+            provider="notary", model="genblaze-inline-manifest-v1",
+            step_type=StepType.CUSTOM, modality=Modality.IMAGE,
+            prompt=source_step.prompt, inputs=[raw_asset], assets=[final_asset],
+            metadata={"operation": "embed_genblaze_manifest", "source_run_id": raw_run.run_id},
+        )
+        receipt_run = Run(
+            run_id=receipt_run_id, name="notary-embedded-receipt",
+            parent_run_id=raw_run.run_id, steps=[receipt_step],
+            metadata={
+                "app": "notary",
+                "provenance_version": "2",
+                "source_manifest_uri": raw_manifest.manifest_uri,
+                "source_run_id": raw_run.run_id,
+                "generation_provider": provider,
+                "generation_model": model,
+            },
+        )
+        receipt_manifest = Manifest.from_run(receipt_run)
+        await asyncio.to_thread(get_b2_storage().write_run, receipt_run, receipt_manifest)
+
+    receipt_result = PipelineResult(receipt_run, receipt_manifest)
+    receipt_record = _pipeline_result_record(receipt_result, provider=provider, model=model, embedded=True)
+    # M0 is retained as an internal lineage node; M1 is the shareable artifact.
+    receipt_record["source_record"] = _pipeline_result_record(
+        raw_result, provider=provider, model=model, embedded=False,
+    )
+    return receipt_record
+
+
+async def _run_embedded_image(provider, *, provider_name: str, model: str, prompt: str, parent_result=None) -> dict:
+    from genblaze_core import Modality
+
+    receipt_run_id = str(uuid.uuid4())
+    raw_result = await _run_pipeline(
+        provider, model=model, prompt=prompt, modality=Modality.IMAGE,
+        parent_result=parent_result,
+        run_metadata={"embedded_receipt_run_id": receipt_run_id},
+    )
+    return await _create_embedded_receipt(
+        raw_result, provider=provider_name, model=model, receipt_run_id=receipt_run_id,
     )
 
 
-async def run_remix_pipeline(
-    parent_run_id: str,
-    parent_manifest_uri: str,
-    prompt: str,
-    modality: str = "image",
-    api_keys: list[str] | None = None,
-) -> dict:
-    """
-    Regenerate from an existing asset via lineage tracking (FR-8).
-    Creates a new asset run with parent_run_id set.
-    """
-    if modality == "video":
-        res = await run_video_pipeline(prompt, api_keys=api_keys)
-    else:
-        res = await run_image_pipeline(prompt, api_keys=api_keys)
+def verify_embedded_receipt(receipt_manifest, file_bytes: bytes, source_manifest=None) -> bool:
+    """Verify M0 extracted from an image and its locked M1 transform receipt."""
+    from genblaze_core.media import get_handler
+    from genblaze_core.models.manifest import parse_manifest
 
-    res["parent_run_id"] = parent_run_id
+    source_uri = receipt_manifest.run.metadata.get("source_manifest_uri")
+    if not source_uri:
+        return True  # Video and legacy records are verified by their own manifest/hash only.
+    output_assets = [asset for step in receipt_manifest.run.steps for asset in step.assets]
+    if not output_assets:
+        return False
+    output = output_assets[-1]
+    handler = get_handler(output.media_type)
+    suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(output.media_type)
+    if handler is None or suffix is None:
+        return False
 
-    # Update manifest in B2/local to include parent_run_id reference
+    with tempfile.TemporaryDirectory(prefix="notary-verify-") as directory:
+        path = Path(directory) / f"submitted{suffix}"
+        path.write_bytes(file_bytes)
+        try:
+            embedded_m0 = handler.extract(path)
+        except Exception:
+            return False
+    if not embedded_m0.verify() or embedded_m0.run.run_id != receipt_manifest.run.parent_run_id:
+        return False
+    if embedded_m0.run.metadata.get("embedded_receipt_run_id") != receipt_manifest.run.run_id:
+        return False
+    if not output.sha256 or hashlib.sha256(file_bytes).hexdigest() != output.sha256:
+        return False
+
+    if source_manifest is None:
+        backend = get_b2_backend()
+        source_key = backend.key_from_url(source_uri)
+        if not source_key:
+            return False
+        try:
+            source_manifest = parse_manifest(json.loads(backend.get(source_key).decode("utf-8")))
+        except Exception:
+            return False
+    return source_manifest.verify() and source_manifest.canonical_hash == embedded_m0.canonical_hash
+
+
+async def _run_google_image(prompt: str, keys: list[str], parent_result=None) -> dict:
+    from genblaze_core import Modality
+    from genblaze_google import GeminiImageProvider
+
+    rotation = MultiKeyGoogleProvider(keys, GeminiImageProvider)
+    last_error: Exception | None = None
+    while True:
+        try:
+            return await _run_embedded_image(
+                rotation.get_provider(), provider_name="google", model=IMAGE_MODEL_ID,
+                prompt=prompt, parent_result=parent_result,
+            )
+        except Exception as exc:
+            last_error = exc
+            if not _is_quota_error(exc) or not rotation.advance():
+                raise RuntimeError(f"Google Genblaze pipeline failed: {exc}") from exc
+            logger.warning("Google quota exhausted on key %d; rotating key", rotation.current_key_index)
+
+
+async def _run_nvidia_image(prompt: str, parent_result=None) -> dict:
+    from genblaze_core import Modality
+    from genblaze_nvidia import NvidiaImageProvider
+
+    api_key = os.getenv("NVIDIA_API_KEY")
+    if not api_key:
+        raise RuntimeError("NVIDIA_API_KEY is not configured")
+    timeout = float(os.getenv("NVIDIA_IMAGE_TIMEOUT_SECONDS", "45"))
+    provider = NvidiaImageProvider(api_key=api_key, http_timeout=timeout, nvcf_timeout=timeout)
     try:
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        manifest_key = f"runs/notary/{date_str}/{res['run_id']}/manifest.json"
-
-        manifest_data = {
-            "run_id": res["run_id"],
-            "parent_run_id": parent_run_id,
-            "provider": res["provider"],
-            "model": res["model"],
-            "prompt": prompt,
-            "modality": modality,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "assets": [
-                {
-                    "key": f"runs/notary/{date_str}/{res['run_id']}/assets/image.png",
-                    "url": res["asset_url"],
-                    "sha256": res["sha256"],
-                    "mime_type": "image/png" if modality == "image" else "video/mp4",
-                }
-            ],
-            "has_embedded_metadata": res.get("has_embedded_metadata", False),
-            "has_visible_label": False,
-            "has_machine_readable_mark": False,
-        }
-
-        backend = get_storage_backend()
-        manifest_uri = backend.put(
-            manifest_key,
-            io.BytesIO(json.dumps(manifest_data, indent=2).encode()),
-            content_type="application/json",
+        return await _run_embedded_image(
+            provider, provider_name="nvidia", model=NVIDIA_IMAGE_MODEL_PRIMARY,
+            prompt=prompt, parent_result=parent_result,
         )
-        res["manifest_uri"] = manifest_uri
-    except Exception as e:
-        logger.warning("Failed to update parent lineage in manifest: %s", e)
+    except Exception as exc:
+        raise RuntimeError(f"NVIDIA Genblaze pipeline failed: {exc}") from exc
 
-    return res
+
+async def _run_huggingface_space_image(prompt: str, parent_result=None) -> dict:
+    space_id = os.getenv("HF_SPACE_ID", HF_SPACE_ID)
+    timeout = float(os.getenv("HF_SPACE_TIMEOUT_SECONDS", "180"))
+    return await _run_embedded_image(
+        HuggingFaceSpaceImageProvider(
+            space_id=space_id,
+            token=os.getenv("HF_TOKEN") or None,
+            timeout_seconds=timeout,
+        ),
+        provider_name="huggingface-space",
+        model=HF_SPACE_MODEL_ID,
+        prompt=prompt,
+        parent_result=parent_result,
+    )
+
+
+async def _run_pollinations_image(prompt: str, parent_result=None) -> dict:
+    api_key = os.getenv("POLLINATIONS_API_KEY")
+    if not api_key:
+        raise RuntimeError("POLLINATIONS_API_KEY is not configured")
+    model = os.getenv("POLLINATIONS_IMAGE_MODEL", POLLINATIONS_IMAGE_MODEL)
+    timeout = float(os.getenv("POLLINATIONS_TIMEOUT_SECONDS", "90"))
+    return await _run_embedded_image(
+        PollinationsImageProvider(api_key=api_key, timeout_seconds=timeout),
+        provider_name="pollinations",
+        model=model,
+        prompt=prompt,
+        parent_result=parent_result,
+    )
+
+
+async def run_image_pipeline(prompt: str, api_keys: list[str] | None = None, parent_result=None) -> dict:
+    """Use Genblaze-backed providers in a resilient, declared order."""
+    errors = []
+    keys = api_keys or load_google_keys()
+    if keys:
+        try:
+            return await _run_google_image(prompt, keys, parent_result)
+        except Exception as exc:
+            errors.append(str(exc))
+            logger.warning("Google pipeline unavailable; trying NVIDIA: %s", exc)
+    if os.getenv("NVIDIA_API_KEY"):
+        try:
+            return await _run_nvidia_image(prompt, parent_result)
+        except Exception as exc:
+            errors.append(str(exc))
+            logger.warning("NVIDIA pipeline unavailable; trying Hugging Face Space: %s", exc)
+    try:
+        return await _run_huggingface_space_image(prompt, parent_result)
+    except Exception as exc:
+        errors.append(str(exc))
+        logger.warning("Hugging Face Space pipeline unavailable; trying Pollinations: %s", exc)
+    if os.getenv("POLLINATIONS_API_KEY"):
+        try:
+            return await _run_pollinations_image(prompt, parent_result)
+        except Exception as exc:
+            errors.append(str(exc))
+    else:
+        errors.append("Pollinations skipped: POLLINATIONS_API_KEY is not configured")
+    raise RuntimeError("No Genblaze image provider succeeded. " + " | ".join(errors))
+
+
+async def run_video_pipeline(prompt: str, api_keys: list[str] | None = None, parent_result=None) -> dict:
+    """Generate Veo video through Genblaze, rotating Google keys on quota."""
+    from genblaze_core import Modality
+    from genblaze_google import VeoProvider
+
+    keys = api_keys or load_google_keys()
+    if not keys:
+        raise RuntimeError("Video generation requires GOOGLE_API_KEYS for the Genblaze Veo provider")
+    rotation = MultiKeyGoogleProvider(keys, VeoProvider)
+    while True:
+        try:
+            result = await _run_pipeline(
+                rotation.get_provider(), model=VIDEO_MODEL_ID,
+                prompt=prompt, modality=Modality.VIDEO, parent_result=parent_result,
+            )
+            return _pipeline_result_record(result, provider="google", model=VIDEO_MODEL_ID)
+        except Exception as exc:
+            if not _is_quota_error(exc) or not rotation.advance():
+                raise RuntimeError(f"Google Veo Genblaze pipeline failed: {exc}") from exc
+            logger.warning("Veo quota exhausted on key %d; rotating key", rotation.current_key_index)
+
+
+async def run_remix_pipeline(parent_run_id: str, parent_manifest_uri: str, prompt: str, modality: str = "image", api_keys: list[str] | None = None) -> dict:
+    """Create Genblaze-native lineage using ``Pipeline.from_result``."""
+    from genblaze_core.models.manifest import parse_manifest
+    from genblaze_core.pipeline.result import PipelineResult
+
+    backend = get_b2_backend()
+    key = backend.key_from_url(parent_manifest_uri)
+    if not key:
+        raise RuntimeError("Parent manifest URI is not owned by the configured B2 backend")
+    parent_manifest = parse_manifest(json.loads(backend.get(key).decode("utf-8")))
+    if not parent_manifest.verify_hash() or parent_manifest.run.run_id != parent_run_id:
+        raise RuntimeError("Parent Genblaze manifest failed verification")
+    parent_result = PipelineResult(parent_manifest.run, parent_manifest)
+    if modality == "video":
+        return await run_video_pipeline(prompt, api_keys=api_keys, parent_result=parent_result)
+    return await run_image_pipeline(prompt, api_keys=api_keys, parent_result=parent_result)

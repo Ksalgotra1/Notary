@@ -23,7 +23,7 @@ class ManifestData:
     modality: str                   # "image" | "video" | "audio"
     created_at: str | None
     sha256: str | None
-    has_embedded_metadata: bool     # manifest embedded in file itself (FR-3)
+    has_embedded_metadata: bool     # inline media provenance has been independently verified
     has_visible_label: bool         # visible "AI-Generated" watermark/overlay
     has_machine_readable_mark: bool # machine-readable mark in standard format
     has_audio_disclosure: bool      # spoken "this is AI-generated" prefix (audio only)
@@ -110,10 +110,9 @@ def _evaluate_india_it_rules_2026(m: ManifestData) -> dict:
             "non-removable provenance metadata present."
             if m.has_embedded_metadata
             else (
-                f"PARTIAL: Asset provenance is immutably locked in Backblaze B2 Object Lock "
-                f"(WORM-compliant) via a signed Genblaze manifest (run_id: {m.run_id}). "
-                "File-embedded metadata (EXIF/XMP/C2PA) would provide stronger compliance "
-                "and is available when using the Google Genblaze provider."
+                f"PARTIAL: A canonical Genblaze manifest is retained in Backblaze B2 for run "
+                f"{m.run_id}, but the media bytes have not been verified as carrying inline provenance. "
+                "Embed an interoperable in-file mark (for example C2PA) before treating this as complete."
             )
         ),
     })
@@ -213,7 +212,7 @@ def _evaluate_eu_ai_act_article_50(m: ManifestData) -> dict:
         "status": "pass" if has_provenance else "fail",
         "detail": (
             f"Full provenance chain: SHA-256 hash, creation timestamp ({m.created_at}), "
-            "run lineage, WORM-locked in B2 Object Lock."
+            "and Genblaze run lineage retained in B2."
             if has_provenance
             else "Partial: provenance metadata incomplete — missing hash or timestamp."
         ),

@@ -13,6 +13,43 @@ class GenerateRequest(BaseModel):
     prompt: str
     modality: Modality = Modality.IMAGE
     provider: Optional[str] = None  # reserved for future multi-provider
+    policy_profile: str = "general"
+    policy_acknowledged: bool = False
+
+
+class PromptReviewRequest(BaseModel):
+    prompt: str
+    policy_profile: str = "general"
+
+
+class PolicyFinding(BaseModel):
+    rule_id: str
+    severity: str
+    detail: str
+    suggestion: str
+
+
+class PromptReviewResponse(BaseModel):
+    profile: str
+    status: str
+    findings: list[PolicyFinding]
+    requires_acknowledgement: bool
+    prompt_was_modified: bool
+
+
+class VisualAuditResult(BaseModel):
+    status: str
+    mode: str
+    model: Optional[str] = None
+    findings: list[str]
+    summary: str
+
+
+class PolicyAuditSummary(BaseModel):
+    profile: str
+    prompt_audit: PromptReviewResponse
+    visual_audit: Optional[VisualAuditResult] = None
+    manifest_uri: Optional[str] = None
 
 
 class GenerateResponse(BaseModel):
@@ -23,6 +60,7 @@ class GenerateResponse(BaseModel):
     sha256: Optional[str] = None
     provider: Optional[str] = None   # e.g. "google" | "nvidia" | "pollinations"
     model: Optional[str] = None      # e.g. "flux" | "gemini-2.5-flash-image"
+    policy_audit: Optional[PolicyAuditSummary] = None
 
 
 class AssetSummary(BaseModel):
@@ -35,6 +73,8 @@ class AssetSummary(BaseModel):
     b2_asset_url: str
     sha256: str
     created_at: str
+    last_verified_at: Optional[str] = None
+    verify_status: Optional[str] = None
 
 
 class AssetDetail(AssetSummary):
@@ -43,6 +83,8 @@ class AssetDetail(AssetSummary):
     verify_status: Optional[str] = None
     params: Optional[dict] = None
     timestamps: Optional[dict] = None
+    policy_profile: Optional[str] = None
+    policy_audit: Optional[PolicyAuditSummary] = None
 
 
 # ── USP Feature 1: Compliance Engine ─────────────────────────────
@@ -86,6 +128,7 @@ class VerifyResponse(BaseModel):
     computed_hash: str
     manifest_hash: str
     verified_at: str
+    manifest_valid: bool = False
     forensic_analysis: Optional[ForensicDetail] = None  # only when match=False
 
 
@@ -104,6 +147,7 @@ class PublicAssetInfo(BaseModel):
     created_at: str
     sha256: str
     compliance_report: Optional[ComplianceReport] = None
+    policy_audit: Optional[PolicyAuditSummary] = None
 
 
 # ── Other models ─────────────────────────────────────────────────

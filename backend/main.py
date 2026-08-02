@@ -5,12 +5,10 @@ All provider credentials stay server-side (NFR-7).
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
 load_dotenv()
 from cache import init_db
-from pipeline import LOCAL_GENERATED_DIR
 from routes import router
 from metrics import init_metrics_db
 
@@ -34,6 +32,11 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
+        "http://localhost:5176",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
@@ -41,9 +44,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-LOCAL_GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/generated", StaticFiles(directory=LOCAL_GENERATED_DIR), name="generated")
 
 app.include_router(router)
 
@@ -59,4 +59,6 @@ async def health():
         "nvidia_key_configured": bool(os.getenv("NVIDIA_API_KEY")),
         "b2_bucket": os.getenv("B2_BUCKET_NAME", "notary-media"),
         "b2_region": os.getenv("B2_REGION", "us-east-005"),
+        "b2_file_lock_required": True,
+        "b2_object_lock_requested": os.getenv("B2_OBJECT_LOCK_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
     }
