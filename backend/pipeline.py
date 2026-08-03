@@ -38,6 +38,17 @@ HF_SPACE_MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
 POLLINATIONS_IMAGE_MODEL = "flux"
 
 
+def _env_flag(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _hf_space_url(space_id: str) -> str:
+    return "https://" + space_id.lower().replace("/", "-").replace(".", "-") + ".hf.space"
+
+
 class HuggingFaceSpaceImageProvider(SyncProvider):
     """Run the public FLUX.2 Klein Space through Genblaze.
 
@@ -48,11 +59,21 @@ class HuggingFaceSpaceImageProvider(SyncProvider):
 
     name = "huggingface-space"
 
-    def __init__(self, *, space_id: str, token: str | None, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        space_id: str,
+        token: str | None,
+        timeout_seconds: float,
+        space_url: str | None = None,
+        ssl_verify: bool = True,
+    ) -> None:
         super().__init__()
         self._space_id = space_id
         self._token = token
         self._timeout_seconds = timeout_seconds
+        self._space_url = space_url or _hf_space_url(space_id)
+        self._ssl_verify = ssl_verify
 
     def get_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
@@ -67,10 +88,11 @@ class HuggingFaceSpaceImageProvider(SyncProvider):
             from gradio_client import Client
 
             client = Client(
-                self._space_id,
+                self._space_url,
                 token=self._token or None,
                 verbose=False,
                 httpx_kwargs={"timeout": self._timeout_seconds},
+                ssl_verify=self._ssl_verify,
             )
             result = client.predict(
                 step.prompt or "",
@@ -100,7 +122,11 @@ class HuggingFaceSpaceImageProvider(SyncProvider):
 
         # Only operational, non-secret details are preserved in provenance.
         step.provider_payload = {
-            "huggingface_space": {"space_id": self._space_id, "authenticated": bool(self._token)}
+            "huggingface_space": {
+                "space_id": self._space_id,
+                "space_url": self._space_url,
+                "authenticated": bool(self._token),
+            }
         }
         step.assets.append(Asset(url=Path(destination).as_uri(), media_type=media_type))
         return step
@@ -521,7 +547,9 @@ async def _run_huggingface_space_image(prompt: str, parent_result=None) -> dict:
     from metrics import record_generation
 
     space_id = os.getenv("HF_SPACE_ID", HF_SPACE_ID)
+    space_url = os.getenv("HF_SPACE_URL") or _hf_space_url(space_id)
     timeout = float(os.getenv("HF_SPACE_TIMEOUT_SECONDS", "180"))
+    ssl_verify = _env_flag("HF_SSL_VERIFY", True)
     t0 = time.monotonic()
     try:
         res = await _run_embedded_image(
@@ -529,6 +557,8 @@ async def _run_huggingface_space_image(prompt: str, parent_result=None) -> dict:
                 space_id=space_id,
                 token=os.getenv("HF_TOKEN") or None,
                 timeout_seconds=timeout,
+                space_url=space_url,
+                ssl_verify=ssl_verify,
             ),
             provider_name="huggingface-space",
             model=HF_SPACE_MODEL_ID,

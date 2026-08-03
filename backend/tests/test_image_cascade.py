@@ -93,7 +93,10 @@ class ImageCascadeTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.dict(sys.modules, {"gradio_client": SimpleNamespace(Client=FakeClient)}):
                 provider = pipeline.HuggingFaceSpaceImageProvider(
-                    space_id="example/space", token="secret-hf-token", timeout_seconds=1,
+                    space_id="example/space",
+                    token="secret-hf-token",
+                    timeout_seconds=1,
+                    space_url="https://example-space.hf.space",
                 )
                 step = provider.generate(
                     Step(
