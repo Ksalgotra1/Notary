@@ -15,6 +15,9 @@ import mimetypes
 import tempfile
 import uuid
 import asyncio
+import time
+from urllib.parse import urlencode, quote
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -108,7 +111,7 @@ class PollinationsImageProvider(SyncProvider):
 
     name = "pollinations"
 
-    def __init__(self, *, api_key: str, timeout_seconds: float) -> None:
+    def __init__(self, *, api_key: str | None, timeout_seconds: float) -> None:
         super().__init__()
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
@@ -125,24 +128,45 @@ class PollinationsImageProvider(SyncProvider):
         try:
             import httpx
 
-            response = httpx.post(
-                "https://gen.pollinations.ai/v1/images/generations",
-                headers={"Authorization": f"Bearer {self._api_key}"},
-                json={
+            if self._api_key:
+                response = httpx.post(
+                    "https://gen.pollinations.ai/v1/images/generations",
+                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    json={
+                        "model": step.model,
+                        "prompt": step.prompt or "",
+                        "n": 1,
+                        "size": "1024x1024",
+                        "response_format": "b64_json",
+                    },
+                    timeout=self._timeout_seconds,
+                )
+                response.raise_for_status()
+                item = response.json()["data"][0]
+                encoded = item.get("b64_json")
+                if not encoded:
+                    raise ValueError("Pollinations response did not contain b64_json output")
+                image_bytes = base64.b64decode(encoded, validate=True)
+                media_type = "image/png"
+            else:
+                query = urlencode({
                     "model": step.model,
-                    "prompt": step.prompt or "",
-                    "n": 1,
-                    "size": "1024x1024",
-                    "response_format": "b64_json",
-                },
-                timeout=self._timeout_seconds,
-            )
-            response.raise_for_status()
-            item = response.json()["data"][0]
-            encoded = item.get("b64_json")
-            if not encoded:
-                raise ValueError("Pollinations response did not contain b64_json output")
-            image_bytes = base64.b64decode(encoded, validate=True)
+                    "width": 1024,
+                    "height": 1024,
+                    "nologo": "true",
+                })
+                prompt = quote(step.prompt or "AI generated image", safe="")
+                response = httpx.get(
+                    f"https://image.pollinations.ai/prompt/{prompt}?{query}",
+                    timeout=self._timeout_seconds,
+                    follow_redirects=True,
+                )
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "")
+                if "image" not in content_type.lower():
+                    raise ValueError(f"Pollinations returned non-image content: {content_type or 'unknown'}")
+                image_bytes = response.content
+                media_type = content_type.split(";", 1)[0].strip() or "image/png"
             if not image_bytes:
                 raise ValueError("Pollinations returned an empty image")
             handle, destination = tempfile.mkstemp(prefix="notary-pollinations-", suffix=".png")
@@ -151,8 +175,14 @@ class PollinationsImageProvider(SyncProvider):
         except Exception as exc:
             raise ProviderError(f"Pollinations image generation failed: {exc}") from exc
 
-        step.provider_payload = {"pollinations": {"model": step.model, "status": "succeeded"}}
-        step.assets.append(Asset(url=Path(destination).as_uri(), media_type="image/png"))
+        step.provider_payload = {
+            "pollinations": {
+                "model": step.model,
+                "status": "succeeded",
+                "authenticated": bool(self._api_key),
+            }
+        }
+        step.assets.append(Asset(url=Path(destination).as_uri(), media_type=media_type))
         return step
 
 
@@ -431,17 +461,27 @@ def verify_embedded_receipt(receipt_manifest, file_bytes: bytes, source_manifest
 async def _run_google_image(prompt: str, keys: list[str], parent_result=None) -> dict:
     from genblaze_core import Modality
     from genblaze_google import GeminiImageProvider
+    from metrics import record_generation
 
     rotation = MultiKeyGoogleProvider(keys, GeminiImageProvider)
-    last_error: Exception | None = None
+    t0 = time.monotonic()
     while True:
         try:
-            return await _run_embedded_image(
+            res = await _run_embedded_image(
                 rotation.get_provider(), provider_name="google", model=IMAGE_MODEL_ID,
                 prompt=prompt, parent_result=parent_result,
             )
+            await record_generation(
+                run_id=res["run_id"], provider="google", model=IMAGE_MODEL_ID,
+                modality="image", success=True, latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+            return res
         except Exception as exc:
-            last_error = exc
+            await record_generation(
+                run_id=None, provider="google", model=IMAGE_MODEL_ID,
+                modality="image", success=False, latency_ms=int((time.monotonic() - t0) * 1000),
+                error_type=type(exc).__name__,
+            )
             if not _is_quota_error(exc) or not rotation.advance():
                 raise RuntimeError(f"Google Genblaze pipeline failed: {exc}") from exc
             logger.warning("Google quota exhausted on key %d; rotating key", rotation.current_key_index)
@@ -450,50 +490,92 @@ async def _run_google_image(prompt: str, keys: list[str], parent_result=None) ->
 async def _run_nvidia_image(prompt: str, parent_result=None) -> dict:
     from genblaze_core import Modality
     from genblaze_nvidia import NvidiaImageProvider
+    from metrics import record_generation
 
     api_key = os.getenv("NVIDIA_API_KEY")
     if not api_key:
         raise RuntimeError("NVIDIA_API_KEY is not configured")
     timeout = float(os.getenv("NVIDIA_IMAGE_TIMEOUT_SECONDS", "45"))
     provider = NvidiaImageProvider(api_key=api_key, http_timeout=timeout, nvcf_timeout=timeout)
+    t0 = time.monotonic()
     try:
-        return await _run_embedded_image(
+        res = await _run_embedded_image(
             provider, provider_name="nvidia", model=NVIDIA_IMAGE_MODEL_PRIMARY,
             prompt=prompt, parent_result=parent_result,
         )
+        await record_generation(
+            run_id=res["run_id"], provider="nvidia", model=NVIDIA_IMAGE_MODEL_PRIMARY,
+            modality="image", success=True, latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+        return res
     except Exception as exc:
+        await record_generation(
+            run_id=None, provider="nvidia", model=NVIDIA_IMAGE_MODEL_PRIMARY,
+            modality="image", success=False, latency_ms=int((time.monotonic() - t0) * 1000),
+            error_type=type(exc).__name__,
+        )
         raise RuntimeError(f"NVIDIA Genblaze pipeline failed: {exc}") from exc
 
 
 async def _run_huggingface_space_image(prompt: str, parent_result=None) -> dict:
+    from metrics import record_generation
+
     space_id = os.getenv("HF_SPACE_ID", HF_SPACE_ID)
     timeout = float(os.getenv("HF_SPACE_TIMEOUT_SECONDS", "180"))
-    return await _run_embedded_image(
-        HuggingFaceSpaceImageProvider(
-            space_id=space_id,
-            token=os.getenv("HF_TOKEN") or None,
-            timeout_seconds=timeout,
-        ),
-        provider_name="huggingface-space",
-        model=HF_SPACE_MODEL_ID,
-        prompt=prompt,
-        parent_result=parent_result,
-    )
+    t0 = time.monotonic()
+    try:
+        res = await _run_embedded_image(
+            HuggingFaceSpaceImageProvider(
+                space_id=space_id,
+                token=os.getenv("HF_TOKEN") or None,
+                timeout_seconds=timeout,
+            ),
+            provider_name="huggingface-space",
+            model=HF_SPACE_MODEL_ID,
+            prompt=prompt,
+            parent_result=parent_result,
+        )
+        await record_generation(
+            run_id=res["run_id"], provider="huggingface-space", model=HF_SPACE_MODEL_ID,
+            modality="image", success=True, latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+        return res
+    except Exception as exc:
+        await record_generation(
+            run_id=None, provider="huggingface-space", model=HF_SPACE_MODEL_ID,
+            modality="image", success=False, latency_ms=int((time.monotonic() - t0) * 1000),
+            error_type=type(exc).__name__,
+        )
+        raise exc
 
 
 async def _run_pollinations_image(prompt: str, parent_result=None) -> dict:
-    api_key = os.getenv("POLLINATIONS_API_KEY")
-    if not api_key:
-        raise RuntimeError("POLLINATIONS_API_KEY is not configured")
+    from metrics import record_generation
+
+    api_key = os.getenv("POLLINATIONS_API_KEY") or None
     model = os.getenv("POLLINATIONS_IMAGE_MODEL", POLLINATIONS_IMAGE_MODEL)
     timeout = float(os.getenv("POLLINATIONS_TIMEOUT_SECONDS", "90"))
-    return await _run_embedded_image(
-        PollinationsImageProvider(api_key=api_key, timeout_seconds=timeout),
-        provider_name="pollinations",
-        model=model,
-        prompt=prompt,
-        parent_result=parent_result,
-    )
+    t0 = time.monotonic()
+    try:
+        res = await _run_embedded_image(
+            PollinationsImageProvider(api_key=api_key, timeout_seconds=timeout),
+            provider_name="pollinations",
+            model=model,
+            prompt=prompt,
+            parent_result=parent_result,
+        )
+        await record_generation(
+            run_id=res["run_id"], provider="pollinations", model=model,
+            modality="image", success=True, latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+        return res
+    except Exception as exc:
+        await record_generation(
+            run_id=None, provider="pollinations", model=model,
+            modality="image", success=False, latency_ms=int((time.monotonic() - t0) * 1000),
+            error_type=type(exc).__name__,
+        )
+        raise exc
 
 
 async def run_image_pipeline(prompt: str, api_keys: list[str] | None = None, parent_result=None) -> dict:
@@ -517,13 +599,10 @@ async def run_image_pipeline(prompt: str, api_keys: list[str] | None = None, par
     except Exception as exc:
         errors.append(str(exc))
         logger.warning("Hugging Face Space pipeline unavailable; trying Pollinations: %s", exc)
-    if os.getenv("POLLINATIONS_API_KEY"):
-        try:
-            return await _run_pollinations_image(prompt, parent_result)
-        except Exception as exc:
-            errors.append(str(exc))
-    else:
-        errors.append("Pollinations skipped: POLLINATIONS_API_KEY is not configured")
+    try:
+        return await _run_pollinations_image(prompt, parent_result)
+    except Exception as exc:
+        errors.append(str(exc))
     raise RuntimeError("No Genblaze image provider succeeded. " + " | ".join(errors))
 
 

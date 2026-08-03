@@ -59,6 +59,25 @@ class ImageCascadeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["run_id"], "pollinations-run")
         self.assertEqual(calls, ["huggingface", "pollinations"])
 
+    async def test_pollinations_runs_as_public_fallback_without_key(self):
+        calls = []
+
+        async def fail_hf(*args, **kwargs):
+            calls.append("huggingface")
+            raise RuntimeError("space unavailable")
+
+        async def succeed_pollinations(*args, **kwargs):
+            calls.append("pollinations")
+            return {"run_id": "public-pollinations-run"}
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(pipeline, "_run_huggingface_space_image", fail_hf), \
+             patch.object(pipeline, "_run_pollinations_image", succeed_pollinations):
+            result = await pipeline.run_image_pipeline("test", api_keys=[])
+
+        self.assertEqual(result["run_id"], "public-pollinations-run")
+        self.assertEqual(calls, ["huggingface", "pollinations"])
+
     async def test_hf_token_is_not_written_to_provider_payload(self):
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image:
             image.write(b"not-a-real-png-but-a-local-provider-output")
@@ -89,7 +108,8 @@ class ImageCascadeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             Path(image_path).unlink(missing_ok=True)
             if 'step' in locals() and step.assets:
-                Path(step.assets[0].url.removeprefix("file://")).unlink(missing_ok=True)
+                clean_path = step.assets[0].url.removeprefix("file://").lstrip("/")
+                Path(clean_path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

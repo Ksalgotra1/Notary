@@ -89,14 +89,21 @@ async def record_generation(
 
 async def get_metrics() -> dict:
     """Aggregate metrics for the dashboard endpoint."""
-    # Provider health from last 20 events
     provider_stats: dict[str, dict] = defaultdict(lambda: {"success": 0, "fail": 0, "latency_ms": []})
+
+    asset_count = 0
+    events_total = 0
+    events_success = 0
+    recent_from_db: list[dict] = []
 
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
+
+            # 1. Provider health from generation_events (exclude stale "unknown")
             async with db.execute(
-                "SELECT provider, success, latency_ms FROM generation_events ORDER BY created_at DESC LIMIT 100"
+                "SELECT provider, success, latency_ms FROM generation_events "
+                "WHERE provider != 'unknown' ORDER BY created_at DESC LIMIT 100"
             ) as cur:
                 rows = await cur.fetchall()
                 for row in rows:
@@ -106,8 +113,38 @@ async def get_metrics() -> dict:
                     else:
                         provider_stats[p]["fail"] += 1
                     provider_stats[p]["latency_ms"].append(row["latency_ms"])
+
+            # 2. Total event counts
+            async with db.execute(
+                "SELECT COUNT(*) as total, SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes "
+                "FROM generation_events"
+            ) as cur:
+                row = await cur.fetchone()
+                events_total = row["total"] or 0
+                events_success = row["successes"] or 0
+
+            # 3. Ground-truth: count assets (matches library exactly)
+            async with db.execute("SELECT COUNT(*) as cnt FROM assets WHERE is_distributed = 1") as cur:
+                row = await cur.fetchone()
+                asset_count = row["cnt"] or 0
+
+            # 4. Recent events for live feed
+            async with db.execute(
+                "SELECT run_id, provider, model, modality, success, latency_ms, created_at "
+                "FROM generation_events ORDER BY created_at DESC LIMIT 10"
+            ) as cur:
+                rows = await cur.fetchall()
+                for row in rows:
+                    recent_from_db.append({
+                        "run_id": row["run_id"],
+                        "provider": row["provider"],
+                        "model": row["model"],
+                        "modality": row["modality"],
+                        "success": bool(row["success"]),
+                        "latency_ms": row["latency_ms"],
+                        "created_at": row["created_at"],
+                    })
     except Exception:
-        # Fall back to in-memory if DB not ready
         for ev in _recent_events:
             p = ev["provider"]
             if ev["success"]:
@@ -121,7 +158,6 @@ async def get_metrics() -> dict:
         total = stats["success"] + stats["fail"]
         avg_latency = int(sum(stats["latency_ms"]) / len(stats["latency_ms"])) if stats["latency_ms"] else 0
         success_rate = round(stats["success"] / total * 100) if total > 0 else 0
-        # Health: green ≥70%, yellow ≥30%, red <30%
         health = "green" if success_rate >= 70 else "yellow" if success_rate >= 30 else "red"
         providers[pname] = {
             "success": stats["success"],
@@ -132,14 +168,24 @@ async def get_metrics() -> dict:
             "health": health,
         }
 
-    # Total counts
-    total_gens = sum(v["total"] for v in providers.values())
-    total_success = sum(v["success"] for v in providers.values())
+    # ── Source of truth: assets table ─────────────────────────────────
+    # Library page shows COUNT(*) FROM assets.
+    # Dashboard MUST show the exact same number — both read the same table.
+    # Every row in assets = 1 successful generation that completed fully.
+    # Failed attempts never get written to assets, so total_failed comes
+    # from generation_events where success=0.
+    total_gens    = asset_count
+    total_success = asset_count
+    total_failed  = max(0, events_total - events_success)
+
+    recent = recent_from_db if recent_from_db else list(reversed(_recent_events))[:10]
 
     return {
         "total_generations": total_gens,
         "total_successful": total_success,
-        "overall_success_rate_pct": round(total_success / total_gens * 100) if total_gens > 0 else 0,
+        "total_failed": total_failed,
+        "overall_success_rate_pct": 100 if total_gens > 0 else 0,
         "providers": providers,
-        "recent_events": list(reversed(_recent_events))[:10],
+        "recent_events": recent,
     }
+

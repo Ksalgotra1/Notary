@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { Plus, Image as ImageIcon, Video as VideoIcon, Layers, FolderOpen, XCircle } from 'lucide-react';
 import api from '../api/client';
 import StatusBadge from '../components/StatusBadge';
+import SmartAssetImage from '../components/SmartAssetImage';
 
 export default function LibraryPage() {
   const [assets, setAssets] = useState([]);
@@ -42,8 +44,10 @@ export default function LibraryPage() {
         <button
           className="btn btn-primary"
           onClick={() => navigate('/')}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
         >
-          + Generate New Asset
+          <Plus style={{ width: 16, height: 16 }} />
+          <span>Generate New Asset</span>
         </button>
       </div>
 
@@ -51,20 +55,26 @@ export default function LibraryPage() {
         <button
           className={`filter-pill ${filterModality === 'all' ? 'active' : ''}`}
           onClick={() => setFilterModality('all')}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
         >
-          All Modalities
+          <Layers style={{ width: 14, height: 14 }} />
+          <span>All Modalities</span>
         </button>
         <button
           className={`filter-pill ${filterModality === 'image' ? 'active' : ''}`}
           onClick={() => setFilterModality('image')}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
         >
-          🖼️ Images
+          <ImageIcon style={{ width: 14, height: 14 }} />
+          <span>Images</span>
         </button>
         <button
           className={`filter-pill ${filterModality === 'video' ? 'active' : ''}`}
           onClick={() => setFilterModality('video')}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
         >
-          🎥 Videos
+          <VideoIcon style={{ width: 14, height: 14 }} />
+          <span>Videos</span>
         </button>
       </div>
 
@@ -75,7 +85,7 @@ export default function LibraryPage() {
         </div>
       ) : error ? (
         <div className="verify-result fail">
-          <span className="verify-result-icon">❌</span>
+          <XCircle style={{ width: 24, height: 24, color: '#ff2047', flexShrink: 0 }} />
           <div className="verify-result-content">
             <h3>Library Load Error</h3>
             <p>{error}</p>
@@ -83,8 +93,8 @@ export default function LibraryPage() {
         </div>
       ) : assets.length === 0 ? (
         <div className="empty-state card">
-          <div className="empty-state-icon">📜</div>
-          <div className="empty-state-title">No Assets Found</div>
+          <FolderOpen style={{ width: 44, height: 44, opacity: 0.4, marginBottom: 12 }} />
+          <div className="empty-state-title" style={{ fontSize: '1.25rem' }}>No Assets Found</div>
           <div className="empty-state-text">
             No generated assets match your current filter. Create your first
             provenance-backed AI asset now.
@@ -92,8 +102,10 @@ export default function LibraryPage() {
           <button
             className="btn btn-primary"
             onClick={() => navigate('/')}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
           >
-            Generate First Asset
+            <Plus style={{ width: 16, height: 16 }} />
+            <span>Generate First Asset</span>
           </button>
         </div>
       ) : (
@@ -117,9 +129,9 @@ export default function LibraryPage() {
                   </video>
                 </div>
               ) : (
-                <img
+                <SmartAssetImage
                   src={asset.b2_asset_url}
-                  alt={asset.prompt}
+                  alt="Failed to generate asset image"
                   className="asset-card-thumbnail"
                 />
               )}
@@ -130,7 +142,9 @@ export default function LibraryPage() {
                 </div>
                 <div className="asset-card-prompt">{asset.prompt}</div>
                 <div className="asset-card-meta mt-3">
-                  <span>{asset.provider} / {asset.model.split('-')[0]}</span>
+                  <span>
+                    {asset.provider} / {asset.model ? (asset.model.includes('/') ? asset.model.split('/')[1] : asset.model) : 'standard'}
+                  </span>
                   <span>{new Date(asset.created_at).toLocaleDateString()}</span>
                 </div>
               </div>

@@ -1,11 +1,23 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
+import {
+  RotateCw,
+  Scissors,
+  Link as LinkIcon,
+  Code,
+  Download,
+  CheckCircle2,
+  XCircle,
+  Scale,
+  Lightbulb,
+  GitBranch,
+} from 'lucide-react';
 import api from '../api/client';
-import StatusBadge from '../components/StatusBadge';
 import ManifestPanel from '../components/ManifestPanel';
 import ComplianceCard from '../components/ComplianceCard';
 import ForensicReport from '../components/ForensicReport';
 import LineageGraph from '../components/LineageGraph';
+import SmartAssetImage from '../components/SmartAssetImage';
 
 export default function AssetPage() {
   const { runId } = useParams();
@@ -49,6 +61,12 @@ export default function AssetPage() {
     loadData();
   }, [loadData]);
 
+  useEffect(() => {
+    setShowRemix(false);
+    setRemixing(false);
+    setVerifyResult(null);
+  }, [runId]);
+
   const handleVerify = async () => {
     setVerifying(true);
     try {
@@ -71,11 +89,16 @@ export default function AssetPage() {
       const res = await api.post(`/assets/${runId}/remix`, {
         prompt: remixPrompt,
       });
+      const remixedRunId = res.data?.run_id;
+      if (!remixedRunId) {
+        throw new Error('Remix completed but the response did not include a run ID.');
+      }
       setShowRemix(false);
-      navigate(`/assets/${res.data.run_id}`);
+      setRemixing(false);
+      navigate(`/assets/${remixedRunId}`);
     } catch (err) {
       console.error(err);
-      showToast('Remix failed to generate', 'error');
+      showToast(err.message || 'Remix failed to generate', 'error');
     } finally {
       setRemixing(false);
     }
@@ -97,7 +120,9 @@ export default function AssetPage() {
       <div className="page">
         <div className="loading-overlay">
           <div className="spinner" />
-          <span>Loading asset details & manifest...</span>
+          <span style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
+            Loading asset details & manifest...
+          </span>
         </div>
       </div>
     );
@@ -107,7 +132,7 @@ export default function AssetPage() {
     return (
       <div className="page">
         <div className="verify-result fail">
-          <span className="verify-result-icon">❌</span>
+          <XCircle style={{ width: 24, height: 24, color: '#ff2047', flexShrink: 0 }} />
           <div className="verify-result-content">
             <h3>Asset Not Found</h3>
             <p>{error || 'The requested run ID does not exist.'}</p>
@@ -119,71 +144,151 @@ export default function AssetPage() {
 
   return (
     <div className="page">
-      <div className="page-header flex justify-between items-center flex-wrap gap-4">
-        <div>
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-xs text-muted font-mono">Run ID: {asset.run_id}</span>
-            {asset.parent_run_id && (
-              <Link to={`/assets/${asset.parent_run_id}`} className="text-xs text-accent hover:underline">
-                ↳ Parent: {asset.parent_run_id.slice(0, 8)}...
-              </Link>
-            )}
-          </div>
-          <h1 className="page-title">{asset.prompt}</h1>
-          <div className="flex items-center gap-3 mt-2">
-            <StatusBadge status={asset.modality} type="modality" />
-            <span className="text-xs text-secondary">
-              Created {new Date(asset.created_at).toLocaleString()}
-            </span>
-          </div>
+      {/* Top Breadcrumb Nav */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          fontSize: '0.8125rem',
+          color: 'var(--text-secondary)',
+          marginBottom: 16,
+          flexWrap: 'wrap',
+          fontFamily: 'var(--font-body)',
+        }}
+      >
+        <Link to="/dashboard" style={{ color: 'var(--text-secondary)', textDecoration: 'none' }} className="hover:underline">
+          AI Asset Compliance & Provenance Dashboard
+        </Link>
+        <span>›</span>
+        <Link to="/library" style={{ color: 'var(--text-secondary)', textDecoration: 'none' }} className="hover:underline">
+          AI Assets
+        </Link>
+        <span>›</span>
+        <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{asset.prompt}</span>
+      </div>
+
+      {/* Header Metadata + Title + Action Bar */}
+      <div style={{ marginBottom: 28 }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 16,
+            fontSize: '0.8125rem',
+            color: 'var(--text-muted)',
+            fontFamily: 'var(--font-mono)',
+            marginBottom: 8,
+            flexWrap: 'wrap',
+          }}
+        >
+          <span>Run ID: {asset.run_id}</span>
+          {asset.parent_run_id && (
+            <Link to={`/assets/${asset.parent_run_id}`} style={{ color: 'var(--accent-blue)', textDecoration: 'none' }}>
+              Parent: {asset.parent_run_id.slice(0, 10)}...
+            </Link>
+          )}
+          <span>Created: {new Date(asset.created_at).toLocaleString()}</span>
         </div>
 
-        <div className="asset-actions">
-          <button className="btn btn-primary" onClick={handleVerify} disabled={verifying}>
-            {verifying ? <div className="spinner" /> : '🔍 Re-Verify Provenance'}
+        <h1
+          className="page-title"
+          style={{
+            fontSize: '2.5rem',
+            fontWeight: 700,
+            fontFamily: 'var(--font-heading)',
+            color: 'var(--text-primary)',
+            margin: '0 0 20px 0',
+            lineHeight: 1.15,
+          }}
+        >
+          {asset.prompt}
+        </h1>
+
+        {/* Action Buttons Row matching screenshot */}
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+          <button
+            className="btn btn-secondary"
+            onClick={handleVerify}
+            disabled={verifying}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
+          >
+            {verifying ? (
+              <div className="spinner" />
+            ) : (
+              <>
+                <RotateCw style={{ width: 14, height: 14 }} />
+                <span>Re-Verify Provenance</span>
+              </>
+            )}
           </button>
-          <button className="btn btn-secondary" onClick={() => setShowRemix(true)}>
-            🔄 Remix Asset
+
+          <button
+            className="btn btn-secondary"
+            onClick={() => setShowRemix(true)}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
+          >
+            <Scissors style={{ width: 14, height: 14 }} />
+            <span>Remix Asset</span>
           </button>
-          <button className="btn btn-secondary" onClick={handleShare}>
-            🔗 Copy Public Portal Link
+
+          <button
+            className="btn btn-secondary"
+            onClick={handleShare}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
+          >
+            <LinkIcon style={{ width: 14, height: 14 }} />
+            <span>Copy Public Portal Link</span>
           </button>
-          <button className="btn btn-secondary" onClick={() => setShowBadge(true)}>
-            🛡️ Embed Badge
+
+          <button
+            className="btn btn-secondary"
+            onClick={() => setShowBadge(true)}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
+          >
+            <Code style={{ width: 14, height: 14 }} />
+            <span>Embed Badge</span>
           </button>
+
           <a
             className="btn btn-secondary"
             href={`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/assets/${runId}/certificate`}
             target="_blank"
             rel="noopener noreferrer"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 8, textDecoration: 'none' }}
           >
-            📜 Download Certificate
+            <Download style={{ width: 14, height: 14 }} />
+            <span>Download Certificate</span>
           </a>
         </div>
       </div>
 
+      {/* Main Split Layout: Left Preview, Right Scorecard & Recommendations */}
       <div className="split-layout">
-        {/* Left Column: Media Preview + Verification Result */}
+        {/* Left Column: Media Preview + Verification Result + Provenance Manifest */}
         <div>
-          <div className="asset-preview">
+          <div className="asset-preview card" style={{ padding: 16, overflow: 'hidden' }}>
             {asset.modality === 'video' ? (
-              <video controls autoPlay loop playsInline key={asset.run_id}>
+              <video controls autoPlay loop playsInline key={asset.run_id} style={{ width: '100%', borderRadius: 8 }}>
                 <source src={asset.b2_asset_url} type="video/mp4" />
                 Your browser does not support video playback.
               </video>
             ) : (
-              <img
+              <SmartAssetImage
                 src={asset.b2_asset_url}
-                alt={asset.prompt}
+                alt="Failed to generate asset image"
+                style={{ borderRadius: 8, width: '100%', display: 'block', maxHeight: 500, objectFit: 'contain' }}
               />
             )}
           </div>
 
           {verifyResult && (
             <div className={`verify-result ${verifyResult.match ? 'pass' : 'fail'}`}>
-              <span className="verify-result-icon">
-                {verifyResult.match ? '✅' : '❌'}
-              </span>
+              {verifyResult.match ? (
+                <CheckCircle2 style={{ width: 24, height: 24, color: '#11ff99', flexShrink: 0 }} />
+              ) : (
+                <XCircle style={{ width: 24, height: 24, color: '#ff2047', flexShrink: 0 }} />
+              )}
               <div className="verify-result-content">
                 <h3>
                   {verifyResult.match
@@ -200,50 +305,75 @@ export default function AssetPage() {
             <ForensicReport forensic={verifyResult.forensic_analysis} />
           )}
 
-          <div className="mt-6">
+          <div style={{ marginTop: 24 }}>
             <ManifestPanel asset={asset} />
           </div>
         </div>
 
-        {/* Right Column: Regulatory Compliance Scorecard (USP #1) */}
-        <div>
-          <div className="mb-4">
-            <h2 className="text-xl font-bold mb-1">
-              🏛️ Regulatory Compliance Scorecard
-            </h2>
-            <p className="text-xs text-secondary">
-              Automated evaluation against global AI transparency mandates.
-            </p>
+        {/* Right Column: Regulatory Compliance Scorecard & Recommendations */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+          {/* Regulatory Compliance Scorecard Card */}
+          <div className="card" style={{ padding: 24 }}>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                marginBottom: 16,
+              }}
+            >
+              <Scale style={{ width: 20, height: 20, color: '#3b9eff' }} />
+              <h2 className="text-section" style={{ fontSize: '1.125rem', fontWeight: 600, margin: 0 }}>
+                Regulatory Compliance Scorecard
+              </h2>
+            </div>
+
+            {compliance ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {compliance.regulations.map((reg) => (
+                  <ComplianceCard key={reg.regulation_id} regulation={reg} />
+                ))}
+              </div>
+            ) : (
+              <div className="text-secondary text-sm">Loading compliance report...</div>
+            )}
           </div>
 
-          {compliance ? (
-            <div>
-              {compliance.regulations.map((reg) => (
-                <ComplianceCard key={reg.regulation_id} regulation={reg} />
-              ))}
-
-              {compliance.recommendations && compliance.recommendations.length > 0 && (
-                <div className="compliance-recommendations card mt-4">
-                  <h4>💡 Actionable Recommendations</h4>
-                  <ul>
-                    {compliance.recommendations.map((rec, idx) => (
-                      <li key={idx}>{rec}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="text-secondary text-sm">
-              Loading compliance report...
+          {/* Actionable Recommendations Card */}
+          {compliance && compliance.recommendations && compliance.recommendations.length > 0 && (
+            <div className="card" style={{ padding: 24 }}>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  marginBottom: 14,
+                }}
+              >
+                <Lightbulb style={{ width: 18, height: 18, color: '#ffc53d' }} />
+                <h2 className="text-section" style={{ fontSize: '1.125rem', fontWeight: 600, margin: 0 }}>
+                  Actionable Recommendations
+                </h2>
+              </div>
+              <ul style={{ paddingLeft: 20, margin: 0, color: 'var(--text-secondary)', fontSize: '0.875rem', lineHeight: 1.6 }}>
+                {compliance.recommendations.map((rec, idx) => (
+                  <li key={idx} style={{ marginBottom: 6 }}>{rec}</li>
+                ))}
+              </ul>
             </div>
           )}
-        </div>
-      </div>
 
-      {/* Lineage DAG */}
-      <div style={{ marginTop: 24 }}>
-        <LineageGraph runId={runId} />
+          {/* Provenance Lineage Graph Card (Right Side of Provenance) */}
+          <div className="card" style={{ padding: 24 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
+              <GitBranch style={{ width: 20, height: 20, color: '#3b9eff' }} />
+              <h2 className="text-section" style={{ fontSize: '1.125rem', fontWeight: 600, margin: 0 }}>
+                Provenance Lineage Graph
+              </h2>
+            </div>
+            <LineageGraph runId={runId} />
+          </div>
+        </div>
       </div>
 
       {/* Remix Modal */}
@@ -295,8 +425,8 @@ export default function AssetPage() {
       {/* Badge Embed Modal */}
       {showBadge && (
         <div className="modal-overlay" onClick={() => setShowBadge(false)}>
-          <div className="modal" onClick={e => e.stopPropagation()}>
-            <h2>🛡️ Embed Provenance Badge</h2>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2>Embed Provenance Badge</h2>
             <p className="text-xs text-secondary mb-4">
               Embed this badge on any webpage to show the live verification status of this asset.
             </p>
@@ -314,7 +444,7 @@ export default function AssetPage() {
                 readOnly
                 rows={3}
                 value={`<a href="${window.location.origin}/verify/${runId}">\n  <img src="${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/badge/${runId}" alt="Verified by Notary" />\n</a>`}
-                onClick={e => e.target.select()}
+                onClick={(e) => e.target.select()}
               />
             </div>
             <div className="modal-actions">
@@ -328,7 +458,7 @@ export default function AssetPage() {
                   setShowBadge(false);
                 }}
               >
-                📋 Copy Embed Code
+                Copy Embed Code
               </button>
             </div>
           </div>

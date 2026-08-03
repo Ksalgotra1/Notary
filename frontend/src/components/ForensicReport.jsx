@@ -1,4 +1,5 @@
 import React from 'react';
+import { Microscope } from 'lucide-react';
 
 export default function ForensicReport({ forensic }) {
   if (!forensic) return null;
@@ -6,7 +7,7 @@ export default function ForensicReport({ forensic }) {
   return (
     <div className="forensic-report">
       <div className="forensic-header">
-        <span className="forensic-icon">🔬</span>
+        <Microscope style={{ width: 20, height: 20, color: '#ff2047' }} />
         <h3 className="forensic-title">
           AI Forensic Analysis — Tamper Evidence Detected
         </h3>

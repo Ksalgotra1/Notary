@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { Image as ImageIcon, Video as VideoIcon, Sparkles, CheckCircle2, XCircle, AlertTriangle, RotateCw, Layers } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
+import SmartAssetImage from '../components/SmartAssetImage';
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
@@ -13,6 +15,10 @@ export default function GeneratePage() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+
+  // ... (rest of state stays same)
+  // Let's replace lines 125-147 in render:
+
   const [genTime, setGenTime] = useState(null);
   const [cascadeLog, setCascadeLog] = useState([]);
   const navigate = useNavigate();
@@ -131,8 +137,10 @@ export default function GeneratePage() {
                   modality === 'image' ? 'active' : ''
                 }`}
                 onClick={() => setModality('image')}
+                style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
               >
-                🖼️ Image (Imagen)
+                <ImageIcon style={{ width: 15, height: 15 }} />
+                <span>Image (Imagen)</span>
               </button>
               <button
                 type="button"
@@ -140,8 +148,10 @@ export default function GeneratePage() {
                   modality === 'video' ? 'active' : ''
                 }`}
                 onClick={() => setModality('video')}
+                style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
               >
-                🎥 Video (Veo)
+                <VideoIcon style={{ width: 15, height: 15 }} />
+                <span>Video (Veo)</span>
               </button>
             </div>
           </div>
@@ -180,89 +190,158 @@ export default function GeneratePage() {
           </div>
 
           {policyReview && (
-            <div className={`verify-result ${policyReview.status === 'block' ? 'fail' : policyReview.status === 'warning' ? 'partial' : 'pass'} mb-6`}>
-              <span className="verify-result-icon">
-                {policyReview.status === 'pass' ? '✓' : policyReview.status === 'warning' ? '!' : '×'}
-              </span>
+            <div
+              className={`verify-result ${
+                policyReview.status === 'block'
+                  ? 'fail'
+                  : policyReview.status === 'warning'
+                  ? 'partial'
+                  : 'pass'
+              } mb-6`}
+            >
+              {policyReview.status === 'pass' ? (
+                <CheckCircle2 style={{ width: 22, height: 22, color: '#11ff99', flexShrink: 0 }} />
+              ) : policyReview.status === 'warning' ? (
+                <AlertTriangle style={{ width: 22, height: 22, color: '#ffc53d', flexShrink: 0 }} />
+              ) : (
+                <XCircle style={{ width: 22, height: 22, color: '#ff2047', flexShrink: 0 }} />
+              )}
               <div className="verify-result-content">
-                <h3>Prompt policy review: {policyReview.status}</h3>
+                <h3 style={{ fontSize: '0.9375rem', textTransform: 'capitalize' }}>
+                  Prompt policy review: {policyReview.status}
+                </h3>
                 {policyReview.findings?.map((finding) => (
-                  <p key={finding.rule_id}><strong>{finding.rule_id}</strong> {finding.detail} {finding.suggestion}</p>
+                  <p key={finding.rule_id} style={{ fontSize: '0.8125rem', marginTop: 4, color: 'var(--text-primary)' }}>
+                    <strong style={{ color: '#fcfdff' }}>{finding.rule_id}:</strong> {finding.detail} {finding.suggestion}
+                  </p>
                 ))}
                 {policyReview.requires_acknowledgement && !policyAcknowledged && (
-                  <label className="text-sm" style={{ display: 'block', marginTop: 10 }}>
+                  <label className="text-sm" style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, cursor: 'pointer', color: '#ffc53d' }}>
                     <input
                       type="checkbox"
                       checked={policyAcknowledged}
                       onChange={(e) => setPolicyAcknowledged(e.target.checked)}
-                    />{' '}
-                    I reviewed this warning and want the audit recorded with the asset.
+                    />
+                    <span>I reviewed this warning and want the audit recorded with the asset.</span>
                   </label>
                 )}
               </div>
             </div>
           )}
 
-          <button
-            type="submit"
-            className="btn btn-primary btn-lg btn-generate w-full"
-            disabled={loading || !prompt.trim()}
-          >
-            {loading ? (
-              <>
-                <div className="spinner" />
-                <span>
-                  {modality === 'video'
-                    ? 'Generating Video (this may take up to 2 min)...'
-                    : 'Generating Image & Signing Manifest...'}
-                </span>
-              </>
-            ) : (
-              <>
-                <span>{policyReview?.requires_acknowledgement && !policyAcknowledged ? 'Acknowledge Warning to Continue' : 'Generate & Lock Provenance'}</span>
-              </>
-            )}
-          </button>
+          <div className="form-actions text-center mt-6">
+            <button
+              type="submit"
+              className="btn btn-primary btn-lg btn-generate"
+              disabled={loading || !prompt.trim()}
+            >
+              {loading ? (
+                <>
+                  <div className="spinner" />
+                  <span>
+                    {modality === 'video'
+                      ? 'Generating Video (this may take up to 2 min)...'
+                      : 'Generating Image & Signing Manifest...'}
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span>{policyReview?.requires_acknowledgement && !policyAcknowledged ? 'Acknowledge Warning to Continue' : 'Generate & Lock Provenance'}</span>
+                </>
+              )}
+            </button>
+          </div>
         </form>
 
         {error && (
-          <div className="verify-result fail mt-6">
-            <span className="verify-result-icon">❌</span>
+          <div className="verify-result fail mt-6" style={{ background: 'rgba(255, 32, 71, 0.08)', border: '1px solid rgba(255, 32, 71, 0.3)', padding: 20 }}>
+            <XCircle style={{ width: 24, height: 24, color: '#ff5c77', flexShrink: 0 }} />
             <div className="verify-result-content">
-              <h3>Generation Error</h3>
-              <p>{error}</p>
+              <h3 style={{ color: '#ff5c77', fontSize: '1rem', fontWeight: 600 }}>Generation Error</h3>
+              <p style={{ color: '#fcfdff', fontSize: '0.875rem', marginTop: 6, lineHeight: 1.6 }}>
+                {error}
+              </p>
             </div>
           </div>
         )}
 
-        {/* Live Cascade Log */}
+        {/* Live Cascade Log Terminal */}
         {cascadeLog.length > 0 && (
-          <div style={{
-            marginTop: 16, background: 'rgba(0,0,0,0.3)', borderRadius: 10,
-            padding: 16, fontFamily: 'monospace', fontSize: 12, maxHeight: 200,
-            overflowY: 'auto',
-          }}>
-            <div style={{ fontSize: 10, color: '#888', marginBottom: 8, fontFamily: 'Inter, sans-serif', fontWeight: 600 }}>
-              🔀 PROVIDER CASCADE LOG
+          <div
+            style={{
+              marginTop: 20,
+              background: '#06060a',
+              border: '1px solid var(--border-strong)',
+              borderRadius: 'var(--radius-lg)',
+              padding: '18px 20px',
+              fontFamily: 'var(--font-mono)',
+              fontSize: '0.8125rem',
+              maxHeight: 240,
+              overflowY: 'auto',
+            }}
+          >
+            <div
+              style={{
+                fontSize: '0.75rem',
+                color: '#3b9eff',
+                marginBottom: 12,
+                fontFamily: 'var(--font-heading)',
+                fontWeight: 600,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                letterSpacing: '0.05em',
+                textTransform: 'uppercase',
+              }}
+            >
+              <Layers style={{ width: 14, height: 14 }} />
+              <span>Provider Cascade Log</span>
             </div>
-            {cascadeLog.map((ev, i) => {
-              const icon = ev.stage === 'cache_hit' ? '⚡'
-                : ev.stage.includes('success') || ev.stage === 'completed' ? '✅'
-                : ev.stage.includes('error') || ev.stage.includes('exhausted') || ev.stage === 'failed' ? '❌'
-                : ev.stage.includes('trying') ? '🔄'
-                : ev.stage.includes('quota') ? '⚠️' : '•';
-              const color = ev.stage === 'cache_hit' ? '#f59e0b'
-                : ev.stage.includes('success') || ev.stage === 'completed' ? '#2ea44f'
-                : ev.stage.includes('error') || ev.stage === 'failed' ? '#d73a49'
-                : '#e3a008';
-              return (
-                <div key={i} style={{ marginBottom: 3, display: 'flex', gap: 8, color }}>
-                  <span>{icon}</span>
-                  <span style={{ color: '#555', minWidth: 55 }}>{ev.elapsed_ms}ms</span>
-                  <span>{ev.message}</span>
-                </div>
-              );
-            })}
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {cascadeLog.map((ev, i) => {
+                const isSuccess = ev.stage.includes('success') || ev.stage === 'completed' || ev.stage === 'cache_hit';
+                const isError = ev.stage.includes('error') || ev.stage.includes('exhausted') || ev.stage === 'failed';
+                const isTrying = ev.stage.includes('trying') || ev.stage.includes('started');
+                const isQuota = ev.stage.includes('quota') || ev.stage.includes('warning');
+
+                const textColor = isSuccess ? '#11ff99' : isError ? '#ff5c77' : isTrying ? '#70baff' : isQuota ? '#ffc53d' : '#fcfdff';
+
+                return (
+                  <div
+                    key={i}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'flex-start',
+                      gap: 10,
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    <span style={{ flexShrink: 0, marginTop: 2 }}>
+                      {isSuccess ? (
+                        <CheckCircle2 style={{ width: 14, height: 14, color: '#11ff99' }} />
+                      ) : isError ? (
+                        <XCircle style={{ width: 14, height: 14, color: '#ff5c77' }} />
+                      ) : isTrying ? (
+                        <RotateCw style={{ width: 14, height: 14, color: '#70baff' }} />
+                      ) : isQuota ? (
+                        <AlertTriangle style={{ width: 14, height: 14, color: '#ffc53d' }} />
+                      ) : (
+                        <span style={{ color: '#a1a4a5' }}>•</span>
+                      )}
+                    </span>
+
+                    <span style={{ color: '#a1a4a5', minWidth: 65, flexShrink: 0, fontFamily: 'var(--font-mono)' }}>
+                      {ev.elapsed_ms}ms
+                    </span>
+
+                    <span style={{ color: textColor, wordBreak: 'break-word', flex: 1, fontFamily: 'var(--font-body)' }}>
+                      {ev.message}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
 
@@ -273,7 +352,7 @@ export default function GeneratePage() {
               <div style={{display: 'flex', gap: '8px', alignItems: 'center'}}>
                 {result.provider && (
                   <span style={{
-                    background: result.provider === 'google' ? '#1a73e8' : result.provider === 'nvidia' ? '#76b900' : '#6366f1',
+                    background: result.provider === 'google' ? '#1a73e8' : result.provider === 'nvidia' ? '#76b900' : '#3b9eff',
                     color: '#fff', fontSize: '11px', fontWeight: 700,
                     padding: '2px 8px', borderRadius: '12px', textTransform: 'uppercase', letterSpacing: '0.5px'
                   }}>
@@ -301,9 +380,9 @@ export default function GeneratePage() {
                 Your browser does not support video playback.
               </video>
             ) : (
-              <img
+              <SmartAssetImage
                 src={result.asset_url}
-                alt="Generated output"
+                alt="Failed to generate asset image"
                 className="generate-result-image"
               />
             )}

@@ -195,34 +195,26 @@ async def update_policy_audit(
 async def get_lineage(db: aiosqlite.Connection, run_id: str) -> dict:
     """
     Walk the parent_run_id chain up to the root AND down to all children,
-    returning the full provenance DAG as a list of nodes and edges.
+    returning the provenance DAG as a list of nodes and edges.
+    Internal nodes (is_distributed=0) are filtered out, and edges bypass them.
     """
-    nodes = {}
-    edges = []
+    raw_nodes = {}
+    parent_map = {}
 
     # Walk UP to root
     current = run_id
     while current:
-        if current in nodes:
+        if current in raw_nodes:
             break
         async with db.execute("SELECT * FROM assets WHERE run_id = ?", (current,)) as cur:
             row = await cur.fetchone()
             if not row:
                 break
             row = dict(row)
-            nodes[current] = {
-                "run_id": current,
-                "prompt": row["prompt"],
-                "provider": row["provider"],
-                "model": row["model"],
-                "modality": row["modality"],
-                "created_at": row["created_at"],
-                "verify_status": row["verify_status"],
-                "b2_asset_url": row["b2_asset_url"],
-            }
+            raw_nodes[current] = row
             parent = row.get("parent_run_id")
             if parent:
-                edges.append({"source": parent, "target": current})
+                parent_map[current] = parent
             current = parent
 
     # Walk DOWN: find all descendants
@@ -236,19 +228,37 @@ async def get_lineage(db: aiosqlite.Connection, run_id: str) -> dict:
             for child in children:
                 child = dict(child)
                 cid = child["run_id"]
-                if cid not in nodes:
-                    nodes[cid] = {
-                        "run_id": cid,
-                        "prompt": child["prompt"],
-                        "provider": child["provider"],
-                        "model": child["model"],
-                        "modality": child["modality"],
-                        "created_at": child["created_at"],
-                        "verify_status": child["verify_status"],
-                        "b2_asset_url": child["b2_asset_url"],
-                    }
-                    edges.append({"source": parent_id, "target": cid})
+                if cid not in raw_nodes:
+                    raw_nodes[cid] = child
+                    parent_map[cid] = parent_id
                     queue.append(cid)
+
+    nodes = {}
+    edges = []
+
+    def get_nearest_distributed_ancestor(n_id):
+        curr = parent_map.get(n_id)
+        while curr:
+            if curr in raw_nodes and raw_nodes[curr].get("is_distributed", 1):
+                return curr
+            curr = parent_map.get(curr)
+        return None
+
+    for nid, row in raw_nodes.items():
+        if row.get("is_distributed", 1):
+            nodes[nid] = {
+                "run_id": nid,
+                "prompt": row["prompt"],
+                "provider": row["provider"],
+                "model": row["model"],
+                "modality": row["modality"],
+                "created_at": row["created_at"],
+                "verify_status": row["verify_status"],
+                "b2_asset_url": row["b2_asset_url"],
+            }
+            ancestor = get_nearest_distributed_ancestor(nid)
+            if ancestor:
+                edges.append({"source": ancestor, "target": nid})
 
     # Find root (node with no incoming edge)
     targets = {e["target"] for e in edges}

@@ -797,10 +797,23 @@ async def provenance_certificate(run_id: str, db: Connection = Depends(get_db)):
             font-size: 20px; font-weight: 800; padding: 4px 16px; border-radius: 8px; }}
   .footer {{ text-align: center; margin-top: 32px; font-size: 11px; color: #555; }}
   .footer a {{ color: #6366f1; }}
-  @media print {{ body {{ background: #fff; color: #222; }} .cert {{ border: 2px solid #6366f1; }} }}
+  @media print {{
+    .no-print {{ display: none !important; }}
+    body {{ background: #ffffff !important; color: #000000 !important; padding: 0 !important; }}
+    .cert {{ border: 2px solid #6366f1 !important; background: #ffffff !important; box-shadow: none !important; color: #000000 !important; padding: 24px !important; }}
+    .field {{ background: #f8fafc !important; border: 1px solid #e2e8f0 !important; }}
+    .field .value {{ color: #0f172a !important; }}
+    table th {{ color: #475569 !important; border-bottom: 1px solid #cbd5e1 !important; }}
+    table td {{ border-bottom: 1px solid #f1f5f9 !important; color: #0f172a !important; }}
+  }}
 </style>
 </head>
 <body>
+<div class="no-print" style="max-width:800px;margin:0 auto 16px auto;display:flex;justify-content:space-between;align-items:center;">
+  <span style="color:#888;font-size:13px;font-family:sans-serif;">📄 Official Provenance Certificate PDF Export</span>
+  <button onclick="window.print()" style="background:#6366f1;color:#fff;border:none;padding:8px 18px;border-radius:6px;font-weight:600;cursor:pointer;font-family:sans-serif;">🖨️ Download / Save as PDF</button>
+</div>
+
 <div class="cert">
   <div class="header">
     <div class="shield">🛡️</div>
@@ -836,6 +849,12 @@ async def provenance_certificate(run_id: str, db: Connection = Depends(get_db)):
     <p style="margin-top:8px;color:#444">Certificate generated at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
   </div>
 </div>
+
+<script>
+  window.addEventListener('DOMContentLoaded', () => {{
+    setTimeout(() => {{ window.print(); }}, 400);
+  }});
+</script>
 </body>
 </html>"""
 
@@ -843,6 +862,6 @@ async def provenance_certificate(run_id: str, db: Connection = Depends(get_db)):
         content=html,
         media_type="text/html",
         headers={
-            "Content-Disposition": f'inline; filename="notary-certificate-{run_id[:8]}.html"',
+            "Content-Disposition": f'inline; filename="notary-certificate-{run_id[:8]}.pdf"',
         },
     )

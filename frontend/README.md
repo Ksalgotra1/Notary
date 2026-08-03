@@ -1,20 +1,23 @@
-# Notary — Frontend
+# Notary Frontend
 
-React (Vite) client. Five routes, all reading and writing through a single
-Axios instance — the client never talks to Backblaze B2 directly. See the
-[root README](../README.md) for the product-level picture and the
-[backend README](../backend/README.md) for the API it calls.
+React + Vite client for Notary Genblaze. The browser talks only to the
+FastAPI backend through a single Axios client; it never writes directly to
+Backblaze B2.
+
+See the [root README](../README.md) for product architecture, provenance,
+provider cascade, and backend setup.
 
 ## Table of Contents
 
-- [Component map](#component-map)
-- [Data flow — live generation](#data-flow--live-generation)
+- [Component Map](#component-map)
+- [Data Flow: Live Generation](#data-flow-live-generation)
 - [Routes](#routes)
-- [Directory structure](#directory-structure)
-- [Design system](#design-system)
+- [Directory Structure](#directory-structure)
+- [Design System](#design-system)
 - [Setup](#setup)
+- [Checks](#checks)
 
-## Component map
+## Component Map
 
 ```mermaid
 flowchart TB
@@ -23,7 +26,7 @@ flowchart TB
     classDef shell fill:#fef3c7,stroke:#f59e0b,color:#451a03
 
     app["App.jsx<br/>router"]:::shell
-    nav["Navbar.jsx<br/>hidden on /verify/:runId"]:::shell
+    sidebar["Sidebar.jsx<br/>hidden on /verify/:runId"]:::shell
 
     generate["GeneratePage"]:::page
     library["LibraryPage"]:::page
@@ -32,12 +35,13 @@ flowchart TB
     dashboard["DashboardPage"]:::page
 
     statusBadge["StatusBadge"]:::component
+    smartImage["SmartAssetImage"]:::component
     manifestPanel["ManifestPanel"]:::component
     complianceCard["ComplianceCard"]:::component
     forensicReport["ForensicReport"]:::component
     lineageGraph["LineageGraph"]:::component
 
-    app --> nav
+    app --> sidebar
     app --> generate
     app --> library
     app --> assetPage
@@ -45,8 +49,9 @@ flowchart TB
     app --> dashboard
 
     generate --> statusBadge
-    library --> statusBadge
-    assetPage --> statusBadge
+    generate --> smartImage
+    library --> smartImage
+    assetPage --> smartImage
     assetPage --> manifestPanel
     assetPage --> complianceCard
     assetPage --> forensicReport
@@ -56,84 +61,132 @@ flowchart TB
 ```
 
 `ComplianceCard` and `ForensicReport` are shared between the authenticated
-`AssetPage` and the no-login `PublicVerifyPage` — same components, same data
-shape, rendered in two different trust contexts.
+asset view and the public verification portal. `SmartAssetImage` provides a
+polished fallback when an asset URL expires or fails to load.
 
-## Data flow — live generation
+## Data Flow: Live Generation
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant U as User
     participant G as GeneratePage
-    participant A as api/client.js
     participant API as FastAPI backend
 
-    U->>G: Enter prompt, submit
-    G->>A: POST /generate/stream
-    A->>API: SSE request
-    API-->>A: event: queued
-    API-->>A: event: provider_selected
-    API-->>A: event: completed {run_id, asset_url, manifest}
-    A-->>G: onmessage updates
-    G-->>U: live progress bar → final result card
+    U->>G: Enter prompt, select modality and policy profile
+    G->>API: POST /policy/prompt-review
+    API-->>G: pass, warning, or block
+    G->>API: POST /generate/stream
+    API-->>G: policy_reviewed
+    API-->>G: starting
+    API-->>G: cache_hit or provider cascade progress
+    API-->>G: completed {run_id, asset_url, manifest_uri, sha256}
+    G-->>U: Result card with Inspect Provenance action
 ```
 
-Video generation can take minutes; the SSE stream is what keeps the UI
-showing real progress instead of a spinner over a blocking request.
+The generation page consumes Server-Sent Events so long image/video runs can
+show cascade progress instead of a static blocking spinner. If the backend
+returns `completed`, the result card links to `/assets/:runId`.
 
 ## Routes
 
-| Path | Page | Auth |
+| Path | Page | Purpose |
 |---|---|---|
-| `/` | `GeneratePage` | app |
-| `/library` | `LibraryPage` | app |
-| `/assets/:runId` | `AssetPage` | app |
-| `/verify/:runId` | `PublicVerifyPage` | none — Navbar hides itself here |
-| `/dashboard` | `DashboardPage` | app |
+| `/` | `GeneratePage` | Prompt entry, policy review, live generation stream |
+| `/dashboard` | `DashboardPage` | Provider health, success rate, latency, recent events |
+| `/library` | `LibraryPage` | Filterable generated asset library |
+| `/assets/:runId` | `AssetPage` | Manifest, media preview, compliance, verification, remix lineage |
+| `/verify/:runId` | `PublicVerifyPage` | No-login public verification portal |
 
-## Directory structure
+The sidebar is hidden on `/verify/:runId` so shared public links render as a
+standalone trust page.
 
-```
+## Directory Structure
+
+```text
 frontend/
+  index.html
+  package.json
+  vite.config.js
+  tailwind.config.js
+  public/
+    favicon.svg
+    icons.svg
   src/
-    main.jsx                  Entry point
-    App.jsx                    Router + route table
+    main.jsx
+    App.jsx
+    index.css
     api/
-      client.js                 Axios instance, 2-min timeout for video gen
-    pages/
-      GeneratePage.jsx        Prompt input, policy profile, live SSE result
-      LibraryPage.jsx           Filterable list backed by the SQLite cache
-      AssetPage.jsx               Full manifest + compliance + forensics + lineage
-      PublicVerifyPage.jsx      No-login portal, drag-and-drop hash verify
-      DashboardPage.jsx        Per-provider health, latency, live event feed
+      client.js
     components/
-      Navbar.jsx                  Top nav, hidden on the public portal
-      StatusBadge.jsx             Small pill: modality / compliance / verify status
-      ManifestPanel.jsx           Collapsible raw manifest + provenance fields
-      ComplianceCard.jsx        Regulation scorecard (India IT Rules / EU AI Act)
-      ForensicReport.jsx           Tamper analysis result, severity-coded
-      LineageGraph.jsx              Interactive SVG remix/version DAG
+      ComplianceCard.jsx
+      ForensicReport.jsx
+      LineageGraph.jsx
+      ManifestPanel.jsx
+      Navbar.jsx
+      Sidebar.jsx
+      SmartAssetImage.jsx
+      StatusBadge.jsx
+    pages/
+      AssetPage.jsx
+      DashboardPage.jsx
+      GeneratePage.jsx
+      LibraryPage.jsx
+      PublicVerifyPage.jsx
 ```
 
-## Design system
+`Navbar.jsx` is still present, but the active app shell is `Sidebar.jsx`.
 
-Dark theme by default (`index.css` root variables); `PublicVerifyPage`
-overrides to a light, high-contrast palette on purpose — the certificate/
-trust context reads differently from the main working app, so it gets its
-own visual register instead of inheriting the dashboard's dark UI.
+## Design System
+
+The app uses a dark operational UI defined mostly in `src/index.css`, with
+Lucide icons for buttons and navigation. The public verification page keeps a
+more standalone certificate/trust feel while reusing the same API contracts.
+
+Asset detail pages include:
+
+- media preview through `SmartAssetImage`
+- compliance scorecards
+- manifest/provenance panels
+- remix lineage DAG navigation
+- certificate, public link, and badge actions
 
 ## Setup
 
+Install dependencies and start the Vite dev server:
+
 ```bash
+cd frontend
 npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. Point `VITE_API_URL` at the backend if it's not
-on `localhost:8000` (see [`api/client.js`](src/api/client.js)):
+Open `http://localhost:5173`.
+
+The frontend defaults to `http://localhost:8000` for the backend. Override it
+with `VITE_API_URL` when needed:
 
 ```bash
-# .env in frontend/, optional — defaults to http://localhost:8000
+# frontend/.env
 VITE_API_URL=http://localhost:8000
 ```
+
+From the repository root, you can also run both frontend and backend with
+Docker Compose:
+
+```bash
+docker compose up
+```
+
+That exposes the frontend at `http://localhost:5173` and the backend at
+`http://localhost:8000`.
+
+## Checks
+
+```bash
+npm run build
+npm run lint
+```
+
+`npm run build` should pass before pushing frontend changes. `npm run lint`
+uses Oxlint when dependencies are installed.

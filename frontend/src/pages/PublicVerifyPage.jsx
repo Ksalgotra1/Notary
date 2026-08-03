@@ -1,5 +1,18 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
+import {
+  Shield,
+  FileCheck,
+  FileText,
+  Copy,
+  Search,
+  UploadCloud,
+  CheckCircle2,
+  XCircle,
+  Scale,
+  ArrowLeft,
+  Check,
+} from 'lucide-react';
 import api from '../api/client';
 import ComplianceCard from '../components/ComplianceCard';
 import ForensicReport from '../components/ForensicReport';
@@ -104,18 +117,21 @@ export default function PublicVerifyPage() {
     <div className="public-verify-page">
       <div className="public-verify-topbar">
         <Link to="/" className="public-verify-brand">
-          <div className="navbar-brand-icon">🛡️</div>
+          <div className="navbar-brand-icon">
+            <Shield style={{ width: 18, height: 18 }} />
+          </div>
           <span>NOTARY PUBLIC PROVENANCE PORTAL</span>
         </Link>
-        <Link to="/" className="btn btn-secondary btn-sm">
-          ← Open App Dashboard
+        <Link to="/" className="btn btn-secondary btn-sm" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <ArrowLeft style={{ width: 14, height: 14 }} />
+          <span>Open App Dashboard</span>
         </Link>
       </div>
 
       <div className="public-verify-container">
         <div className="public-verify-header">
           <div className="certificate-badge">
-            <span className="certificate-badge-icon">📜</span>
+            <FileCheck style={{ width: 14, height: 14 }} />
             <span>PUBLIC PROVENANCE CERTIFICATE</span>
           </div>
           <h1>Independent Asset Audit Certificate</h1>
@@ -131,7 +147,7 @@ export default function PublicVerifyPage() {
           </div>
         ) : error ? (
           <div className="verify-result fail">
-            <span className="verify-result-icon">❌</span>
+            <XCircle style={{ width: 24, height: 24, color: '#ff2047', flexShrink: 0 }} />
             <div className="verify-result-content">
               <h3>Record Not Found</h3>
               <p>{error}</p>
@@ -142,8 +158,14 @@ export default function PublicVerifyPage() {
             {/* Provenance Certificate Card */}
             <div className="provenance-card">
               <div className="provenance-card-header">
-                <h2>🏛️ Official Provenance Record</h2>
-                <span className="badge badge-verified">✓ Immutable Record</span>
+                <h2 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <FileText style={{ width: 20, height: 20, color: '#3b9eff' }} />
+                  <span>Official Provenance Record</span>
+                </h2>
+                <span className="badge badge-verified" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <Check style={{ width: 12, height: 12 }} />
+                  <span>Immutable Record</span>
+                </span>
               </div>
 
               <div className="provenance-grid">
@@ -177,8 +199,18 @@ export default function PublicVerifyPage() {
                 <div className="provenance-item full-width">
                   <div className="provenance-label flex justify-between items-center">
                     <span>Canonical SHA-256 Hash</span>
-                    <button className="btn btn-ghost btn-sm py-0 text-xs" onClick={copyHash}>
-                      {copiedHash ? '✓ Copied!' : '📋 Copy Hash'}
+                    <button className="btn btn-ghost btn-sm py-0 text-xs" onClick={copyHash} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      {copiedHash ? (
+                        <>
+                          <Check style={{ width: 12, height: 12 }} />
+                          <span>Copied!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy style={{ width: 12, height: 12 }} />
+                          <span>Copy Hash</span>
+                        </>
+                      )}
                     </button>
                   </div>
                   <div className="provenance-value hash-box">{assetInfo.sha256}</div>
@@ -189,7 +221,10 @@ export default function PublicVerifyPage() {
             {/* Drag & Drop File Integrity Check */}
             <div className="provenance-card mt-6">
               <div className="provenance-card-header">
-                <h2>🔍 File Integrity & Audit Check</h2>
+                <h2 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Search style={{ width: 20, height: 20, color: '#3b9eff' }} />
+                  <span>File Integrity & Audit Check</span>
+                </h2>
                 <span className="text-xs text-secondary font-mono">Web Crypto API</span>
               </div>
               <p className="text-sm text-secondary mb-4">
@@ -209,7 +244,9 @@ export default function PublicVerifyPage() {
                   style={{ display: 'none' }}
                   onChange={onFileChangeHandler}
                 />
-                <div className="drop-zone-icon">📥</div>
+                <div style={{ display: 'flex', justifyContent: 'center' }}>
+                  <UploadCloud style={{ width: 36, height: 36, opacity: 0.5, marginBottom: 8 }} />
+                </div>
                 <div className="drop-zone-text">
                   {droppedFileName ? (
                     <strong className="text-primary">Selected: {droppedFileName}</strong>
@@ -231,7 +268,7 @@ export default function PublicVerifyPage() {
 
               {dropError && (
                 <div className="verify-result fail mt-4">
-                  <span className="verify-result-icon">❌</span>
+                  <XCircle style={{ width: 24, height: 24, color: '#ff2047', flexShrink: 0 }} />
                   <div className="verify-result-content">
                     <h3>Verification Error</h3>
                     <p>{dropError}</p>
@@ -245,9 +282,11 @@ export default function PublicVerifyPage() {
                     verifyResult.match ? 'pass' : 'fail'
                   }`}
                 >
-                  <span className="verify-result-icon">
-                    {verifyResult.match ? '✅' : '❌'}
-                  </span>
+                  {verifyResult.match ? (
+                    <CheckCircle2 style={{ width: 24, height: 24, color: '#11ff99', flexShrink: 0 }} />
+                  ) : (
+                    <XCircle style={{ width: 24, height: 24, color: '#ff2047', flexShrink: 0 }} />
+                  )}
                   <div className="verify-result-content">
                     <h3>
                       {verifyResult.match
@@ -269,8 +308,9 @@ export default function PublicVerifyPage() {
             {assetInfo.compliance_report && (
               <div className="mt-6">
                 <div className="mb-4">
-                  <h2 className="text-xl font-bold mb-1">
-                    🏛️ Public Regulatory Compliance Scorecard
+                  <h2 className="text-xl font-bold mb-1" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <Scale style={{ width: 22, height: 22, color: '#3b9eff' }} />
+                    <span>Public Regulatory Compliance Scorecard</span>
                   </h2>
                   <p className="text-xs text-secondary">
                     Compliance evaluation against international AI transparency mandates.

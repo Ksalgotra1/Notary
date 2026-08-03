@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import StatusBadge from './StatusBadge';
 
 export default function ComplianceCard({ regulation }) {
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(false);
 
   if (!regulation) return null;
 

@@ -116,7 +116,7 @@ export default function LineageGraph({ runId }) {
         <defs>
           <marker id="arrowhead" viewBox="0 0 10 8" refX="10" refY="4"
                   markerWidth="8" markerHeight="6" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 4 L 0 8 z" fill="#6366f1" />
+            <path d="M 0 0 L 10 4 L 0 8 z" fill="#3b9eff" />
           </marker>
         </defs>
 
@@ -132,7 +132,7 @@ export default function LineageGraph({ runId }) {
               y1={from.y + NODE_H}
               x2={to.x + NODE_W / 2}
               y2={to.y}
-              stroke="#6366f1"
+              stroke="#3b9eff"
               strokeWidth={2}
               strokeDasharray={e.source === data.root ? "none" : "4 4"}
               markerEnd="url(#arrowhead)"
@@ -148,8 +148,8 @@ export default function LineageGraph({ runId }) {
           const isCurrent = node.run_id === runId;
           const prov = PROVIDER_STYLES[node.provider] || PROVIDER_STYLES.unknown;
           const isRoot = node.run_id === data.root;
-          const statusColor = node.verify_status === 'pass' ? '#2ea44f'
-            : node.verify_status === 'fail' ? '#d73a49' : '#e3a008';
+          const statusColor = node.verify_status === 'pass' ? '#11ff99'
+            : node.verify_status === 'fail' ? '#ff2047' : '#ffc53d';
 
           return (
             <g
@@ -161,9 +161,9 @@ export default function LineageGraph({ runId }) {
                 x={pos.x} y={pos.y}
                 width={NODE_W} height={NODE_H}
                 rx={10}
-                fill={isCurrent ? 'rgba(99,102,241,0.15)' : 'rgba(255,255,255,0.04)'}
-                stroke={isCurrent ? '#6366f1' : 'rgba(255,255,255,0.1)'}
-                strokeWidth={isCurrent ? 2.5 : 1}
+                fill={isCurrent ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.02)'}
+                stroke={isCurrent ? '#fcfdff' : 'rgba(255,255,255,0.14)'}
+                strokeWidth={isCurrent ? 2 : 1}
               />
               {/* Status dot */}
               <circle cx={pos.x + NODE_W - 12} cy={pos.y + 12} r={5} fill={statusColor} />
@@ -176,26 +176,26 @@ export default function LineageGraph({ runId }) {
               {/* Root badge */}
               {isRoot && (
                 <>
-                  <rect x={pos.x + 82} y={pos.y + 8} width={40} height={16} rx={8} fill="#e3a008" />
+                  <rect x={pos.x + 82} y={pos.y + 8} width={40} height={16} rx={8} fill="#ffc53d" />
                   <text x={pos.x + 102} y={pos.y + 20} textAnchor="middle"
-                        fill="#fff" fontSize={8} fontWeight={700}>ROOT</text>
+                        fill="#000" fontSize={8} fontWeight={700}>ROOT</text>
                 </>
               )}
 
               {/* Prompt snippet */}
-              <text x={pos.x + 10} y={pos.y + 42} fill="#ddd" fontSize={11} fontWeight={600}>
+              <text x={pos.x + 10} y={pos.y + 42} fill="#fcfdff" fontSize={11} fontWeight={500}>
                 {(node.prompt || '').slice(0, 28)}{(node.prompt || '').length > 28 ? '…' : ''}
               </text>
 
               {/* Run ID + date */}
-              <text x={pos.x + 10} y={pos.y + 60} fill="#888" fontSize={9} fontFamily="monospace">
+              <text x={pos.x + 10} y={pos.y + 60} fill="#888e90" fontSize={9} fontFamily="Geist Mono, monospace">
                 {node.run_id.slice(0, 8)}… · {(node.created_at || '').slice(0, 10)}
               </text>
 
               {/* Current indicator */}
               {isCurrent && (
                 <text x={pos.x + NODE_W - 14} y={pos.y + NODE_H - 8}
-                      fill="#6366f1" fontSize={9} fontWeight={700} textAnchor="end">YOU</text>
+                      fill="#fcfdff" fontSize={9} fontWeight={700} textAnchor="end">YOU</text>
               )}
             </g>
           );

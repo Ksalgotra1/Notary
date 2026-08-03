@@ -1,5 +1,6 @@
 import React from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
+import { Shield, Wand2, Library, Activity } from 'lucide-react';
 
 export default function Navbar() {
   const location = useLocation();
@@ -12,7 +13,9 @@ export default function Navbar() {
   return (
     <header className="navbar">
       <NavLink to="/" className="navbar-brand">
-        <div className="navbar-brand-icon">🛡️</div>
+        <div className="navbar-brand-icon">
+          <Shield style={{ width: 18, height: 18, strokeWidth: 2.2 }} />
+        </div>
         <span>Notary</span>
       </NavLink>
       <nav className="navbar-links">
@@ -23,7 +26,10 @@ export default function Navbar() {
           }
           end
         >
-          Generate
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <Wand2 style={{ width: 14, height: 14 }} />
+            <span>Generate</span>
+          </span>
         </NavLink>
         <NavLink
           to="/library"
@@ -31,7 +37,10 @@ export default function Navbar() {
             `navbar-link ${isActive ? 'active' : ''}`
           }
         >
-          Library
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <Library style={{ width: 14, height: 14 }} />
+            <span>Library</span>
+          </span>
         </NavLink>
         <NavLink
           to="/dashboard"
@@ -39,7 +48,10 @@ export default function Navbar() {
             `navbar-link ${isActive ? 'active' : ''}`
           }
         >
-          ⚡ Dashboard
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <Activity style={{ width: 14, height: 14 }} />
+            <span>Dashboard</span>
+          </span>
         </NavLink>
       </nav>
     </header>
