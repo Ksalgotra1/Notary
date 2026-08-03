@@ -52,6 +52,7 @@ Notary's own logic layer does:
 - [User flow](#user-flow)
 - [How verification works — the M0/M1 chain](#how-verification-works--the-m0m1-chain)
 - [Provider resilience](#provider-resilience)
+- [Bring Your Own Keys (BYOK)](#bring-your-own-keys-byok)
 - [Features](#features)
   - [Compliance Engine](#compliance-engine)
   - [AI Forensic Verification](#ai-forensic-verification)
@@ -63,6 +64,7 @@ Notary's own logic layer does:
 - [Setup](#setup)
 - [Providers & models](#providers--models)
 - [What Notary does *not* claim](#what-notary-does-not-claim)
+- [License](#license)
 
 ---
 
@@ -215,6 +217,18 @@ Every successful output — regardless of which stage produced it — still runs
 through the same Genblaze pipeline and lands in B2 with the same manifest
 guarantees. Video (Veo) runs the same pipeline without this cascade. Exhausting
 one Google key doesn't fail a request while another key still has quota.
+
+## Bring Your Own Keys (BYOK)
+
+Notary supports per-request user keys for Google Gemini and NVIDIA so the app
+can be tested even when server-side quotas are constrained or when you want to
+verify the flow with your own credentials. Keys entered in the UI are held in
+browser session storage for the current tab, sent to the backend only for that
+request, and never written to B2, the database, or any manifest.
+
+This is a convenience layer on top of the normal provider flow, not a separate
+product path: if you do not enter keys, Notary still uses the configured server
+credentials and its free-tier fallback cascade where available.
 
 ## Features
 
@@ -426,3 +440,11 @@ explainable rule-matching, not a safety guarantee. These boundaries are
 enforced in code, not just in this paragraph — `has_visible_label` and
 `has_embedded_metadata` default to `False` until explicitly set after a real
 embed step, so a gap shows up as a gap, never as a silent pass.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
+
+Third-party dependencies remain under their respective licenses. You are
+responsible for complying with terms for any external models, SDKs, APIs, and
+assets used by your deployment.

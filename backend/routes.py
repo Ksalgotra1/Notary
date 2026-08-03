@@ -266,11 +266,14 @@ async def generate(req: GenerateRequest, db: Connection = Depends(get_db)):
     # ── End cache check ──
 
     t0 = time.monotonic()
+    # BYOK: resolve per-request user-supplied keys (never logged, never stored)
+    user_google_keys = [req.google_api_key] if req.google_api_key else None
+    user_nvidia_key = req.nvidia_api_key or None
     try:
         if req.modality.value == "video":
-            res = await run_video_pipeline(req.prompt)
+            res = await run_video_pipeline(req.prompt, api_keys=user_google_keys)
         else:
-            res = await run_image_pipeline(req.prompt)
+            res = await run_image_pipeline(req.prompt, api_keys=user_google_keys, nvidia_api_key=user_nvidia_key)
     except Exception as exc:
         latency_ms = int((time.monotonic() - t0) * 1000)
         await record_generation(
@@ -676,8 +679,15 @@ async def generate_stream(req: GenerateRequest, db: Connection = Depends(get_db)
         # ── End cache check ──
 
         yield emit_genblaze("starting", "Starting the Genblaze pipeline with B2 File Lock provenance...")
+        # BYOK: resolve per-request user-supplied keys (never logged, never stored)
+        user_google_keys = [req.google_api_key] if req.google_api_key else None
+        user_nvidia_key = req.nvidia_api_key or None
         try:
-            res = await (run_video_pipeline(req.prompt) if req.modality.value == "video" else run_image_pipeline(req.prompt))
+            res = await (
+                run_video_pipeline(req.prompt, api_keys=user_google_keys)
+                if req.modality.value == "video"
+                else run_image_pipeline(req.prompt, api_keys=user_google_keys, nvidia_api_key=user_nvidia_key)
+            )
             latency_ms = int((time.monotonic() - t0) * 1000)
             await record_generation(
                 run_id=res["run_id"], provider=res["provider"], model=res["model"],
@@ -730,7 +740,14 @@ async def _save_asset_to_db(db, req, res, modality: str | None = None):
     source_record = res.get("source_record")
     if source_record:
         await insert_asset(db, row_for(source_record, is_distributed=False))
-    await insert_asset(db, row_for(res, is_distributed=True))
+        # The M1 receipt's parent_run_id points to the internal M0 run — this is
+        # a provenance-chain detail, not a user-initiated remix.  Null it out on
+        # the user-facing row so the UI doesn't show a false "Parent" link.
+        m1_row = row_for(res, is_distributed=True)
+        m1_row["parent_run_id"] = None
+        await insert_asset(db, m1_row)
+    else:
+        await insert_asset(db, row_for(res, is_distributed=True))
 
 
 # ── Provenance Certificate ───────────────────────────────────────

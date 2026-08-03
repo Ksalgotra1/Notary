@@ -487,12 +487,12 @@ async def _run_google_image(prompt: str, keys: list[str], parent_result=None) ->
             logger.warning("Google quota exhausted on key %d; rotating key", rotation.current_key_index)
 
 
-async def _run_nvidia_image(prompt: str, parent_result=None) -> dict:
+async def _run_nvidia_image(prompt: str, parent_result=None, nvidia_api_key: str | None = None) -> dict:
     from genblaze_core import Modality
     from genblaze_nvidia import NvidiaImageProvider
     from metrics import record_generation
 
-    api_key = os.getenv("NVIDIA_API_KEY")
+    api_key = nvidia_api_key or os.getenv("NVIDIA_API_KEY")
     if not api_key:
         raise RuntimeError("NVIDIA_API_KEY is not configured")
     timeout = float(os.getenv("NVIDIA_IMAGE_TIMEOUT_SECONDS", "45"))
@@ -578,8 +578,17 @@ async def _run_pollinations_image(prompt: str, parent_result=None) -> dict:
         raise exc
 
 
-async def run_image_pipeline(prompt: str, api_keys: list[str] | None = None, parent_result=None) -> dict:
-    """Use Genblaze-backed providers in a resilient, declared order."""
+async def run_image_pipeline(
+    prompt: str,
+    api_keys: list[str] | None = None,
+    parent_result=None,
+    nvidia_api_key: str | None = None,
+) -> dict:
+    """Use Genblaze-backed providers in a resilient, declared order.
+
+    User-supplied keys (from BYOK) take precedence over server .env keys.
+    They are used in-flight only and never logged or stored.
+    """
     errors = []
     keys = api_keys or load_google_keys()
     if keys:
@@ -588,9 +597,9 @@ async def run_image_pipeline(prompt: str, api_keys: list[str] | None = None, par
         except Exception as exc:
             errors.append(str(exc))
             logger.warning("Google pipeline unavailable; trying NVIDIA: %s", exc)
-    if os.getenv("NVIDIA_API_KEY"):
+    if nvidia_api_key or os.getenv("NVIDIA_API_KEY"):
         try:
-            return await _run_nvidia_image(prompt, parent_result)
+            return await _run_nvidia_image(prompt, parent_result, nvidia_api_key=nvidia_api_key)
         except Exception as exc:
             errors.append(str(exc))
             logger.warning("NVIDIA pipeline unavailable; trying Hugging Face Space: %s", exc)
@@ -628,7 +637,14 @@ async def run_video_pipeline(prompt: str, api_keys: list[str] | None = None, par
             logger.warning("Veo quota exhausted on key %d; rotating key", rotation.current_key_index)
 
 
-async def run_remix_pipeline(parent_run_id: str, parent_manifest_uri: str, prompt: str, modality: str = "image", api_keys: list[str] | None = None) -> dict:
+async def run_remix_pipeline(
+    parent_run_id: str,
+    parent_manifest_uri: str,
+    prompt: str,
+    modality: str = "image",
+    api_keys: list[str] | None = None,
+    nvidia_api_key: str | None = None,
+) -> dict:
     """Create Genblaze-native lineage using ``Pipeline.from_result``."""
     from genblaze_core.models.manifest import parse_manifest
     from genblaze_core.pipeline.result import PipelineResult
@@ -643,4 +659,4 @@ async def run_remix_pipeline(parent_run_id: str, parent_manifest_uri: str, promp
     parent_result = PipelineResult(parent_manifest.run, parent_manifest)
     if modality == "video":
         return await run_video_pipeline(prompt, api_keys=api_keys, parent_result=parent_result)
-    return await run_image_pipeline(prompt, api_keys=api_keys, parent_result=parent_result)
+    return await run_image_pipeline(prompt, api_keys=api_keys, parent_result=parent_result, nvidia_api_key=nvidia_api_key)

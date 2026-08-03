@@ -15,6 +15,9 @@ class GenerateRequest(BaseModel):
     provider: Optional[str] = None  # reserved for future multi-provider
     policy_profile: str = "general"
     policy_acknowledged: bool = False
+    # BYOK: user-supplied keys sent per-request, never stored server-side
+    google_api_key: Optional[str] = None
+    nvidia_api_key: Optional[str] = None
 
 
 class PromptReviewRequest(BaseModel):

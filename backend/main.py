@@ -47,6 +47,9 @@ async def health():
         "status": "ok",
         "google_keys_configured": len(keys),
         "nvidia_key_configured": bool(os.getenv("NVIDIA_API_KEY")),
+        # HuggingFace and Pollinations are always available as free-tier fallbacks
+        "huggingface_available": True,
+        "pollinations_available": True,
         "b2_bucket": os.getenv("B2_BUCKET_NAME", "notary-media"),
         "b2_region": os.getenv("B2_REGION", "us-east-005"),
         "b2_file_lock_required": True,
