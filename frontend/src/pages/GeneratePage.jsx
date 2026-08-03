@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Image as ImageIcon, Video as VideoIcon, Sparkles, CheckCircle2, XCircle, AlertTriangle, RotateCw, Layers } from 'lucide-react';
+import { Image as ImageIcon, Video as VideoIcon, Sparkles, CheckCircle2, XCircle, AlertTriangle, RotateCw, Layers, Key, ChevronDown, ExternalLink, Eye, EyeOff, Trash2 } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
 import SmartAssetImage from '../components/SmartAssetImage';
 
@@ -22,6 +22,56 @@ export default function GeneratePage() {
   const [genTime, setGenTime] = useState(null);
   const [cascadeLog, setCascadeLog] = useState([]);
   const navigate = useNavigate();
+
+  // ── BYOK state ────────────────────────────────────────────────────
+  const [byokExpanded, setByokExpanded] = useState(false);
+  const [userGoogleKey, setUserGoogleKey] = useState(() => sessionStorage.getItem('byok_google') || '');
+  const [userNvidiaKey, setUserNvidiaKey] = useState(() => sessionStorage.getItem('byok_nvidia') || '');
+  const [showGoogleKey, setShowGoogleKey] = useState(false);
+  const [showNvidiaKey, setShowNvidiaKey] = useState(false);
+  const [health, setHealth] = useState(null);
+
+  useEffect(() => {
+    fetch(`${BASE_URL}/health`).then(r => r.json()).then(setHealth).catch(() => {});
+  }, []);
+
+  const handleGoogleKeyChange = (val) => {
+    setUserGoogleKey(val);
+    if (val) sessionStorage.setItem('byok_google', val);
+    else sessionStorage.removeItem('byok_google');
+  };
+  const handleNvidiaKeyChange = (val) => {
+    setUserNvidiaKey(val);
+    if (val) sessionStorage.setItem('byok_nvidia', val);
+    else sessionStorage.removeItem('byok_nvidia');
+  };
+  const clearAllKeys = () => {
+    setUserGoogleKey('');
+    setUserNvidiaKey('');
+    sessionStorage.removeItem('byok_google');
+    sessionStorage.removeItem('byok_nvidia');
+  };
+
+  const hasUserKeys = userGoogleKey.trim() || userNvidiaKey.trim();
+  // ── End BYOK state ────────────────────────────────────────────────
+
+  const THINKING_WORDS = [
+    'Notarizing', 'Hashing', 'Sealing', 'Contemplating',
+    'Triangulating', 'Crystallizing', 'Authenticating', 'Forging',
+    'Minting', 'Inscribing', 'Certifying', 'Etching',
+    'Encoding', 'Anchoring', 'Commissioning', 'Orchestrating',
+  ];
+
+  const [thinkingIdx, setThinkingIdx] = useState(0);
+
+  useEffect(() => {
+    if (!loading) return;
+    setThinkingIdx(0);
+    const interval = setInterval(() => {
+      setThinkingIdx(prev => (prev + 1) % THINKING_WORDS.length);
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [loading]);
 
   const handleGenerate = async (e) => {
     e.preventDefault();
@@ -65,6 +115,9 @@ export default function GeneratePage() {
           modality,
           policy_profile: policyProfile,
           policy_acknowledged: policyAcknowledged,
+          // BYOK: send user keys per-request; never stored server-side
+          ...(userGoogleKey.trim() ? { google_api_key: userGoogleKey.trim() } : {}),
+          ...(userNvidiaKey.trim() ? { nvidia_api_key: userNvidiaKey.trim() } : {}),
         }),
       });
 
@@ -189,6 +242,152 @@ export default function GeneratePage() {
             </select>
           </div>
 
+          {/* ── BYOK: Bring Your Own Keys ──────────────────────────── */}
+          <div className={`byok-panel ${byokExpanded ? 'expanded' : ''} mb-6`}>
+            <button
+              type="button"
+              className="byok-header"
+              onClick={() => setByokExpanded(p => !p)}
+              aria-expanded={byokExpanded}
+            >
+              <span className="byok-header-left">
+                <Key style={{ width: 14, height: 14 }} />
+                <span>Bring Your Own API Keys</span>
+                {hasUserKeys && <span className="byok-keys-active-dot" title="Custom keys active" />}
+              </span>
+              <ChevronDown
+                style={{
+                  width: 15, height: 15,
+                  transition: 'transform 0.25s ease',
+                  transform: byokExpanded ? 'rotate(180deg)' : 'rotate(0deg)',
+                }}
+              />
+            </button>
+
+            {byokExpanded && (
+              <div className="byok-body">
+                {/* Transparency block */}
+                <div className="byok-transparency">
+                  <p>
+                    <strong>This is an early-stage, open-source student project.</strong> We don&apos;t
+                    yet have production Google Gemini or NVIDIA API keys, so free-tier providers
+                    (HuggingFace, Pollinations) are used by default — they may be slower or occasionally
+                    unavailable.
+                  </p>
+                  <p style={{ marginTop: 8 }}>
+                    If you have your own API keys, you can add them below. They&apos;re sent
+                    in-memory per-request and <strong>never stored on any server,
+                    database, or manifest</strong>.
+                  </p>
+                  <a
+                    href="https://github.com/Ksalgotra1/notary"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="byok-github-link"
+                  >
+                    <ExternalLink style={{ width: 12, height: 12 }} />
+                    Verify on GitHub — github.com/Ksalgotra1/notary
+                  </a>
+                </div>
+
+                {/* Provider status row */}
+                <div className="byok-provider-status">
+                  {[
+                    {
+                      label: 'Google Gemini',
+                      active: health ? health.google_keys_configured > 0 || userGoogleKey.trim() : !!userGoogleKey.trim(),
+                      note: userGoogleKey.trim() ? 'your key' : health?.google_keys_configured > 0 ? 'server key' : 'no key',
+                    },
+                    {
+                      label: 'NVIDIA',
+                      active: health ? health.nvidia_key_configured || !!userNvidiaKey.trim() : !!userNvidiaKey.trim(),
+                      note: userNvidiaKey.trim() ? 'your key' : health?.nvidia_key_configured ? 'server key' : 'no key',
+                    },
+                    {
+                      label: 'HuggingFace',
+                      active: true,
+                      note: 'free tier',
+                    },
+                    {
+                      label: 'Pollinations',
+                      active: true,
+                      note: 'free tier',
+                    },
+                  ].map(p => (
+                    <div key={p.label} className="byok-provider-chip">
+                      <span className={`byok-status-dot ${p.active ? 'active' : 'inactive'}`} />
+                      <span className="byok-provider-label">{p.label}</span>
+                      <span className="byok-provider-note">{p.note}</span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Key inputs */}
+                <div className="byok-inputs">
+                  <div className="byok-input-group">
+                    <label className="byok-input-label">Google Gemini API Key</label>
+                    <div className="byok-input-wrapper">
+                      <input
+                        type={showGoogleKey ? 'text' : 'password'}
+                        className="byok-input"
+                        placeholder="AIza..."
+                        value={userGoogleKey}
+                        onChange={e => handleGoogleKeyChange(e.target.value)}
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      <button
+                        type="button"
+                        className="byok-toggle-btn"
+                        onClick={() => setShowGoogleKey(p => !p)}
+                        title={showGoogleKey ? 'Hide key' : 'Show key'}
+                      >
+                        {showGoogleKey
+                          ? <EyeOff style={{ width: 13, height: 13 }} />
+                          : <Eye style={{ width: 13, height: 13 }} />}
+                      </button>
+                    </div>
+                    <span className="byok-input-hint">From <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">Google AI Studio</a> — enables Imagen &amp; Veo</span>
+                  </div>
+
+                  <div className="byok-input-group">
+                    <label className="byok-input-label">NVIDIA API Key</label>
+                    <div className="byok-input-wrapper">
+                      <input
+                        type={showNvidiaKey ? 'text' : 'password'}
+                        className="byok-input"
+                        placeholder="nvapi-..."
+                        value={userNvidiaKey}
+                        onChange={e => handleNvidiaKeyChange(e.target.value)}
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      <button
+                        type="button"
+                        className="byok-toggle-btn"
+                        onClick={() => setShowNvidiaKey(p => !p)}
+                        title={showNvidiaKey ? 'Hide key' : 'Show key'}
+                      >
+                        {showNvidiaKey
+                          ? <EyeOff style={{ width: 13, height: 13 }} />
+                          : <Eye style={{ width: 13, height: 13 }} />}
+                      </button>
+                    </div>
+                    <span className="byok-input-hint">From <a href="https://build.nvidia.com" target="_blank" rel="noopener noreferrer">NVIDIA Build</a> — enables FLUX</span>
+                  </div>
+                </div>
+
+                {hasUserKeys && (
+                  <button type="button" className="byok-clear-btn" onClick={clearAllKeys}>
+                    <Trash2 style={{ width: 12, height: 12 }} />
+                    Clear saved keys
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          {/* ── End BYOK ─────────────────────────────────────────── */}
+
           {policyReview && (
             <div
               className={`verify-result ${
@@ -238,10 +437,14 @@ export default function GeneratePage() {
               {loading ? (
                 <>
                   <div className="spinner" />
-                  <span>
-                    {modality === 'video'
-                      ? 'Generating Video (this may take up to 2 min)...'
-                      : 'Generating Image & Signing Manifest...'}
+                  <span
+                    key={thinkingIdx}
+                    style={{
+                      display: 'inline-block',
+                      animation: 'thinkingFadeIn 0.4s ease',
+                    }}
+                  >
+                    {THINKING_WORDS[thinkingIdx]}...
                   </span>
                 </>
               ) : (
