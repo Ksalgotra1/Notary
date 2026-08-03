@@ -64,6 +64,7 @@ Notary's own logic layer does:
 - [Setup](#setup)
 - [Providers & models](#providers--models)
 - [What Notary does *not* claim](#what-notary-does-not-claim)
+- [License](#license)
 
 ---
 
@@ -439,3 +440,11 @@ explainable rule-matching, not a safety guarantee. These boundaries are
 enforced in code, not just in this paragraph — `has_visible_label` and
 `has_embedded_metadata` default to `False` until explicitly set after a real
 embed step, so a gap shows up as a gap, never as a silent pass.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
+
+Third-party dependencies remain under their respective licenses. You are
+responsible for complying with terms for any external models, SDKs, APIs, and
+assets used by your deployment.
