@@ -95,6 +95,7 @@ async def get_metrics() -> dict:
     events_total = 0
     events_success = 0
     recent_from_db: list[dict] = []
+    recent_from_assets: list[dict] = []
 
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -128,7 +129,39 @@ async def get_metrics() -> dict:
                 row = await cur.fetchone()
                 asset_count = row["cnt"] or 0
 
-            # 4. Recent events for live feed
+            # 4. Asset-derived provider summary. This keeps the dashboard useful
+            # after a cache rebuild or one-time telemetry clear, because assets
+            # are the durable successful-generation index.
+            async with db.execute(
+                """SELECT provider, model, modality, COUNT(*) as cnt
+                   FROM assets
+                   WHERE is_distributed = 1
+                   GROUP BY provider, model, modality"""
+            ) as cur:
+                rows = await cur.fetchall()
+                if not provider_stats:
+                    for row in rows:
+                        provider_stats[row["provider"]]["success"] += row["cnt"] or 0
+
+            async with db.execute(
+                """SELECT run_id, provider, model, modality, created_at
+                   FROM assets
+                   WHERE is_distributed = 1
+                   ORDER BY created_at DESC LIMIT 10"""
+            ) as cur:
+                rows = await cur.fetchall()
+                for row in rows:
+                    recent_from_assets.append({
+                        "run_id": row["run_id"],
+                        "provider": row["provider"],
+                        "model": row["model"],
+                        "modality": row["modality"],
+                        "success": True,
+                        "latency_ms": 0,
+                        "created_at": row["created_at"],
+                    })
+
+            # 5. Recent events for live feed
             async with db.execute(
                 "SELECT run_id, provider, model, modality, success, latency_ms, created_at "
                 "FROM generation_events ORDER BY created_at DESC LIMIT 10"
@@ -178,7 +211,7 @@ async def get_metrics() -> dict:
     total_success = asset_count
     total_failed  = max(0, events_total - events_success)
 
-    recent = recent_from_db if recent_from_db else list(reversed(_recent_events))[:10]
+    recent = recent_from_db or list(reversed(_recent_events))[:10] or recent_from_assets
 
     return {
         "total_generations": total_gens,
