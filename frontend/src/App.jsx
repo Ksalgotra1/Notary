@@ -1,5 +1,6 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { Analytics } from '@vercel/analytics/react';
 import Sidebar from './components/Sidebar';
 import GeneratePage from './pages/GeneratePage';
 import LibraryPage from './pages/LibraryPage';
@@ -22,6 +23,7 @@ export default function App() {
           </Routes>
         </main>
       </div>
+      <Analytics />
     </BrowserRouter>
   );
 }
