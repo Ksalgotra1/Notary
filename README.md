@@ -12,7 +12,9 @@ built on Backblaze B2 and Genblaze.**
 ![FastAPI](https://img.shields.io/badge/backend-FastAPI-009688?style=flat-square)
 ![React](https://img.shields.io/badge/frontend-React%20%2B%20Vite-61dafb?style=flat-square)
 
-**Live app:** _add your deployed URL here before submitting_ · **Demo video:** _add link_
+**Live app:** [notary-swart.vercel.app](https://notary-swart.vercel.app/) · **Demo video:** [Watch Demo](https://youtu.be/KTUHwr0N9fI)
+
+
 
 **Service docs:** [`backend/README.md`](backend/README.md) · [`frontend/README.md`](frontend/README.md)
 
