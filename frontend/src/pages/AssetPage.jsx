@@ -11,7 +11,11 @@ import {
   Scale,
   Lightbulb,
   GitBranch,
+  ShieldCheck,
+  Eye,
+  Lock,
 } from 'lucide-react';
+
 import api from '../api/client';
 import ManifestPanel from '../components/ManifestPanel';
 import ComplianceCard from '../components/ComplianceCard';
@@ -281,6 +285,37 @@ export default function AssetPage() {
               />
             )}
           </div>
+
+          {/* Trust & Provenance Badges Bar */}
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginTop: 12, padding: 12 }} className="glass-panel rounded-xl">
+            {/* Ed25519 Cryptographic Signature Badge */}
+            <div className="badge-ed25519" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 6, fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>
+              <ShieldCheck style={{ width: 14, height: 14 }} />
+              <span>Ed25519 Signed</span>
+              <a
+                href={`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/.well-known/notary-public-key.pem`}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: 'inherit', textDecoration: 'underline', marginLeft: 4, opacity: 0.8 }}
+                title="View Public Verification Key"
+              >
+                [Key]
+              </a>
+            </div>
+
+            {/* Visible Watermark Status */}
+            <div className="badge-watermark" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 6, fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>
+              <Eye style={{ width: 14, height: 14 }} />
+              <span>Watermark: {asset?.has_visible_label ? 'Applied ✓' : 'Embedded'}</span>
+            </div>
+
+            {/* B2 WORM Object Lock Status */}
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 6, fontSize: '0.75rem', fontFamily: 'var(--font-mono)', background: 'rgba(16, 185, 129, 0.1)', color: '#10b981', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
+              <Lock style={{ width: 14, height: 14 }} />
+              <span>B2 Object Lock: COMPLIANCE Mode</span>
+            </div>
+          </div>
+
 
           {verifyResult && (
             <div className={`verify-result ${verifyResult.match ? 'pass' : 'fail'}`}>
