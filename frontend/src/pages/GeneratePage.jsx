@@ -280,13 +280,13 @@ export default function GeneratePage() {
                     database, or manifest</strong>.
                   </p>
                   <a
-                    href="https://github.com/Ksalgotra1/notary"
+                    href="https://github.com/Ksalgotra1/Notary"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="byok-github-link"
                   >
                     <ExternalLink style={{ width: 12, height: 12 }} />
-                    Verify on GitHub — github.com/Ksalgotra1/notary
+                    Verify on GitHub — github.com/Ksalgotra1/Notary
                   </a>
                 </div>
 
