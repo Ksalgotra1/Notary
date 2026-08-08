@@ -17,6 +17,8 @@ from metrics import init_metrics_db
 async def lifespan(app: FastAPI):
     await init_db()
     await init_metrics_db()
+    from signing import init_signing_keys
+    init_signing_keys()
     yield
 
 

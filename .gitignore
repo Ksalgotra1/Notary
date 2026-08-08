@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# Ed25519 signing keys (private key must NEVER be committed)
+certs/
+
+
 # Docs — internal planning only, not for public repo
 docs/
 

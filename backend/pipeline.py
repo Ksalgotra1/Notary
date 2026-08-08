@@ -288,7 +288,7 @@ def get_b2_storage():
     retention_days = int(os.getenv("B2_MANIFEST_RETENTION_DAYS", "365"))
     if retention_days < 1:
         raise StorageConfigurationError("B2_MANIFEST_RETENTION_DAYS must be at least 1")
-    mode = os.getenv("B2_OBJECT_LOCK_MODE", "GOVERNANCE").upper()
+    mode = os.getenv("B2_OBJECT_LOCK_MODE", "COMPLIANCE").upper()
     if mode not in {"GOVERNANCE", "COMPLIANCE"}:
         raise StorageConfigurationError("B2_OBJECT_LOCK_MODE must be GOVERNANCE or COMPLIANCE")
 
@@ -323,7 +323,7 @@ def _pipeline_result_record(result, *, provider: str, model: str, embedded: bool
         "provider": provider,
         "model": model,
         "has_embedded_metadata": embedded,
-        "has_visible_label": False,
+        "has_visible_label": embedded,  # True for M1 (watermarked + embedded), False for M0 (raw)
         "has_machine_readable_mark": embedded,
         "manifest_verified": True,
         "object_lock_enabled": True,
@@ -384,6 +384,11 @@ async def _create_embedded_receipt(raw_result, *, provider: str, model: str, rec
     if not suffix:
         raise RuntimeError(f"Inline embedding is not enabled for {raw_asset.media_type}")
 
+    # Apply visible watermark before manifest embedding so the badge is
+    # part of the canonical signed bytes covered by M1.
+    from watermark import apply_watermark
+    raw_bytes = apply_watermark(raw_bytes, raw_asset.media_type)
+
     with tempfile.TemporaryDirectory(prefix="notary-embed-") as directory:
         path = Path(directory) / f"embedded{suffix}"
         path.write_bytes(raw_bytes)
@@ -416,6 +421,19 @@ async def _create_embedded_receipt(raw_result, *, provider: str, model: str, rec
             },
         )
         receipt_manifest = Manifest.from_run(receipt_run)
+
+        # Sign the canonical M1 manifest with Ed25519 — independent trust anchor.
+        # Stored in the manifest metadata so it is WORM-locked alongside the run.
+        try:
+            from signing import sign_manifest, canonical_manifest_json
+            import json as _json
+            sig = sign_manifest(canonical_manifest_json(receipt_manifest.to_dict()))
+            receipt_run.metadata["ed25519_signature"] = sig
+            receipt_manifest = Manifest.from_run(receipt_run)
+            logger.debug("signing: M1 manifest signed for run %s", receipt_run_id)
+        except Exception as _sig_exc:
+            logger.warning("signing: Ed25519 signing failed for %s (%s) — continuing without signature", receipt_run_id, _sig_exc)
+
         await asyncio.to_thread(get_b2_storage().write_run, receipt_run, receipt_manifest)
 
     receipt_result = PipelineResult(receipt_run, receipt_manifest)

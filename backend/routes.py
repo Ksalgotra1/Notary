@@ -223,6 +223,24 @@ async def _forensic_detail(row: dict, submitted_bytes: bytes) -> ForensicDetail 
 
 # ── Core generation endpoints ─────────────────────────────────────
 
+@router.get("/.well-known/notary-public-key.pem", response_class=Response)
+async def notary_public_key():
+    """
+    Publish the Notary Ed25519 public key for independent manifest verification.
+    Third parties can use this to verify that manifests were signed by Notary
+    and have not been forged, even if B2 credentials were compromised.
+    """
+    try:
+        from signing import get_public_key_pem
+        return Response(
+            content=get_public_key_pem(),
+            media_type="application/x-pem-file",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Public key not available: {exc}") from exc
+
+
 @router.post("/policy/prompt-review", response_model=PromptReviewResponse)
 async def prompt_review(req: PromptReviewRequest):
     """Review a prompt without sending it to a provider or altering it."""
