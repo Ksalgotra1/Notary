@@ -6,7 +6,7 @@ from pathlib import Path
 # Ensure backend modules are importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from c2pa_signer import _ensure_certs_exist, inject_c2pa_manifest, CERTS_DIR
+from c2pa_signer import _ensure_certs_exist, inject_c2pa_manifest, CERTS_DIR, ROOT_CERT_PATH
 
 
 class TestCertGeneration(unittest.TestCase):
@@ -27,12 +27,18 @@ class TestCertGeneration(unittest.TestCase):
         content = cert_path.read_text()
         self.assertIn("BEGIN CERTIFICATE", content)
 
-    def test_cert_has_correct_cn(self):
+    def test_signing_certificate_has_correct_cn_and_root_chain(self):
         from cryptography import x509
         _, cert_path = _ensure_certs_exist()
         cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
         cn = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)[0].value
-        self.assertEqual(cn, "Notary Cryptographic Authority")
+        self.assertEqual(cn, "Notary Content Credentials Signing")
+
+        root = x509.load_pem_x509_certificate(ROOT_CERT_PATH.read_bytes())
+        self.assertEqual(cert.issuer, root.subject)
+        self.assertTrue(
+            root.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+        )
 
 
 class TestC2PAInjection(unittest.TestCase):
@@ -85,10 +91,10 @@ class TestC2PAInjection(unittest.TestCase):
                 "manifest_uri": "https://example.invalid/manifest.json",
             },
         )
-        # C2PA JUMBF header adds bytes to the file if injection succeeded,
-        # or degrades gracefully to returning original bytes if cert verification fails.
-        self.assertGreaterEqual(len(result), len(png_bytes),
-                           "C2PA injection should return valid asset bytes")
+        # The local root CA is trusted by the signing context, so a valid
+        # image must receive an embedded C2PA JUMBF manifest.
+        self.assertGreater(len(result), len(png_bytes),
+                           "C2PA injection should embed a JUMBF manifest")
 
 
 if __name__ == "__main__":

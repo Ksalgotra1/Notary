@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { CheckCircle2 } from 'lucide-react';
 import StatusBadge from './StatusBadge';
 
 export default function ComplianceCard({ regulation }) {
@@ -36,6 +37,13 @@ export default function ComplianceCard({ regulation }) {
 
       {expanded && (
         <>
+          {/* Celebration banner when fully compliant */}
+          {regulation.compliant && regulation.passed === regulation.total && (
+            <div className="compliance-banner-pass">
+              <CheckCircle2 style={{ width: 15, height: 15, flexShrink: 0 }} />
+              <span>FULLY COMPLIANT — {regulation.passed}/{regulation.total} checks passed</span>
+            </div>
+          )}
           <div className="compliance-checks">
             {regulation.checks.map((check) => (
               <div key={check.requirement_id} className="compliance-check">
@@ -63,3 +71,4 @@ export default function ComplianceCard({ regulation }) {
     </div>
   );
 }
+
