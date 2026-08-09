@@ -289,18 +289,31 @@ export default function AssetPage() {
           {/* Trust & Provenance Badges Bar */}
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginTop: 12, padding: 12 }} className="glass-panel rounded-xl">
             {/* Ed25519 Cryptographic Signature Badge */}
-            <div className="badge-ed25519" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 6, fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>
+            <div 
+              className="badge-ed25519" 
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 6, fontSize: '0.75rem', fontFamily: 'var(--font-mono)', cursor: 'pointer' }}
+              title="Ed25519 is an elliptic curve signature scheme. This signature guarantees the manifest was issued by Notary's cryptographic authority. Click to copy the public key."
+              onClick={async () => {
+                try {
+                  const keyUrl = `${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/.well-known/notary-public-key.pem?t=${Date.now()}`;
+                  const response = await fetch(keyUrl);
+                  if (!response.ok) throw new Error('Failed to fetch key');
+                  const keyText = await response.text();
+                  await navigator.clipboard.writeText(keyText);
+                  showToast('Public verification key copied to clipboard!', 'success');
+                } catch (err) {
+                  showToast('Failed to copy public key.', 'error');
+                }
+              }}
+            >
               <ShieldCheck style={{ width: 14, height: 14 }} />
               <span>Ed25519 Signed</span>
-              <a
-                href={`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/.well-known/notary-public-key.pem`}
-                target="_blank"
-                rel="noreferrer"
+              <span
                 style={{ color: 'inherit', textDecoration: 'underline', marginLeft: 4, opacity: 0.8 }}
-                title="View Public Verification Key"
+                title="Copy Public Verification Key"
               >
                 [Key]
-              </a>
+              </span>
             </div>
 
             {/* Visible Watermark Status */}

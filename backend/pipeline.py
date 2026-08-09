@@ -393,20 +393,46 @@ async def _create_embedded_receipt(raw_result, *, provider: str, model: str, rec
         path = Path(directory) / f"embedded{suffix}"
         path.write_bytes(raw_bytes)
         handler.embed(path, raw_manifest)
-        final_bytes = path.read_bytes()
+        embedded_bytes = path.read_bytes()
+
+        # Inject C2PA Content Credentials JUMBF header after Genblaze manifest
+        # embedding so the C2PA signature covers the embedded provenance.
+        has_c2pa = False
+        try:
+            from c2pa_signer import inject_c2pa_manifest
+            source_step = next(step for step in reversed(raw_run.steps) if step.assets)
+            c2pa_bytes = inject_c2pa_manifest(
+                embedded_bytes,
+                raw_asset.media_type,
+                {
+                    "run_id": raw_run.run_id,
+                    "provider": provider,
+                    "model": model,
+                    "prompt": source_step.prompt if source_step else "",
+                    "manifest_uri": raw_manifest.manifest_uri,
+                },
+            )
+            if len(c2pa_bytes) > len(embedded_bytes):
+                embedded_bytes = c2pa_bytes
+                has_c2pa = True
+                logger.info("c2pa: Content Credentials injected for run %s", receipt_run_id)
+        except Exception as c2pa_exc:
+            logger.warning("c2pa: injection failed for %s (%s) — continuing without C2PA", receipt_run_id, c2pa_exc)
+
+        final_bytes = embedded_bytes
         final_sha256 = hashlib.sha256(final_bytes).hexdigest()
 
         final_asset = Asset(
             url=path.as_uri(), media_type=raw_asset.media_type,
             sha256=final_sha256, size_bytes=len(final_bytes),
-            metadata={"embedded_manifest_run_id": raw_run.run_id},
+            metadata={"embedded_manifest_run_id": raw_run.run_id, "has_c2pa": has_c2pa},
         )
         source_step = next(step for step in reversed(raw_run.steps) if step.assets)
         receipt_step = Step(
             provider="notary", model="genblaze-inline-manifest-v1",
             step_type=StepType.CUSTOM, modality=Modality.IMAGE,
             prompt=source_step.prompt, inputs=[raw_asset], assets=[final_asset],
-            metadata={"operation": "embed_genblaze_manifest", "source_run_id": raw_run.run_id},
+            metadata={"operation": "embed_genblaze_manifest", "source_run_id": raw_run.run_id, "has_c2pa": has_c2pa},
         )
         receipt_run = Run(
             run_id=receipt_run_id, name="notary-embedded-receipt",
@@ -418,6 +444,7 @@ async def _create_embedded_receipt(raw_result, *, provider: str, model: str, rec
                 "source_run_id": raw_run.run_id,
                 "generation_provider": provider,
                 "generation_model": model,
+                "has_c2pa": has_c2pa,
             },
         )
         receipt_manifest = Manifest.from_run(receipt_run)
@@ -434,15 +461,21 @@ async def _create_embedded_receipt(raw_result, *, provider: str, model: str, rec
         except Exception as _sig_exc:
             logger.warning("signing: Ed25519 signing failed for %s (%s) — continuing without signature", receipt_run_id, _sig_exc)
 
+        # Write the final signed bytes back to the temp file so the B2 sink
+        # uploads the C2PA-signed version, not the pre-C2PA version.
+        path.write_bytes(final_bytes)
+
         await asyncio.to_thread(get_b2_storage().write_run, receipt_run, receipt_manifest)
 
     receipt_result = PipelineResult(receipt_run, receipt_manifest)
     receipt_record = _pipeline_result_record(receipt_result, provider=provider, model=model, embedded=True)
+    receipt_record["has_c2pa"] = has_c2pa
     # M0 is retained as an internal lineage node; M1 is the shareable artifact.
     receipt_record["source_record"] = _pipeline_result_record(
         raw_result, provider=provider, model=model, embedded=False,
     )
     return receipt_record
+
 
 
 async def _run_embedded_image(provider, *, provider_name: str, model: str, prompt: str, parent_result=None) -> dict:

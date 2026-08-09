@@ -176,7 +176,9 @@ def _evaluate_eu_ai_act_article_50(m: ManifestData) -> dict:
         "description": "Machine-readable mark enabling detection of artificial origin",
         "status": "pass" if m.has_machine_readable_mark else "partial",
         "detail": (
-            "Machine-readable provenance mark embedded via Genblaze manifest."
+            "C2PA Content Credentials (ES256 JUMBF header) embedded directly into asset bytes "
+            "alongside Backblaze B2 WORM-locked Genblaze manifest. Verifiable on "
+            "contentcredentials.org and compatible tooling."
             if m.has_machine_readable_mark
             else (
                 f"PARTIAL: A machine-readable Genblaze JSON manifest is stored in "
@@ -187,6 +189,7 @@ def _evaluate_eu_ai_act_article_50(m: ManifestData) -> dict:
             )
         ),
     })
+
 
     # EU-ART50-03: Content disclosed as AI-generated
     disclosed = m.has_visible_label or m.has_embedded_metadata
