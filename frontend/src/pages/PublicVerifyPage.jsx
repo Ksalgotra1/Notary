@@ -352,6 +352,51 @@ export default function PublicVerifyPage() {
                 </div>
               )}
 
+              {/* pHash Perceptual Similarity Analysis Banner */}
+              {verifyResult && verifyResult.phash_match && (
+                <div
+                  className="verify-result mt-3"
+                  style={{
+                    background: verifyResult.phash_match.is_perceptual_match
+                      ? 'rgba(59, 158, 255, 0.08)'
+                      : 'rgba(255, 170, 0, 0.08)',
+                    borderColor: verifyResult.phash_match.is_perceptual_match
+                      ? '#3b9eff'
+                      : '#ffaa00',
+                  }}
+                >
+                  <Search
+                    style={{
+                      width: 22,
+                      height: 22,
+                      color: verifyResult.phash_match.is_perceptual_match
+                        ? '#3b9eff'
+                        : '#ffaa00',
+                      flexShrink: 0,
+                    }}
+                  />
+                  <div className="verify-result-content">
+                    <h3
+                      style={{
+                        color: verifyResult.phash_match.is_perceptual_match
+                          ? '#3b9eff'
+                          : '#ffaa00',
+                        fontSize: '0.95rem',
+                        marginBottom: 4,
+                      }}
+                    >
+                      Perceptual Hash (pHash) Analysis — {verifyResult.phash_match.similarity_pct}% Similarity
+                    </h3>
+                    <p className="text-xs" style={{ marginBottom: 4 }}>
+                      <strong>Verdict:</strong> {verifyResult.phash_match.verdict}
+                    </p>
+                    <p className="text-xs font-mono opacity-75">
+                      Submitted pHash: {verifyResult.phash_match.submitted_phash} | Stored: {verifyResult.phash_match.stored_phash} (Distance: {verifyResult.phash_match.hamming_distance}/64)
+                    </p>
+                  </div>
+                </div>
+              )}
+
               {verifyResult && verifyResult.forensic_analysis && (
                 <ForensicReport forensic={verifyResult.forensic_analysis} />
               )}

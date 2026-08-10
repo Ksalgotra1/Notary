@@ -510,11 +510,11 @@ async def public_verify(
                     "similarity_pct": round((1 - distance / 64) * 100, 1),
                     "is_perceptual_match": distance <= 4,
                     "verdict": (
-                        "Visually identical — file modified by compression or re-encoding"
+                        "Visually identical - file modified by compression or re-encoding"
                         if distance <= 4
                         else "Perceptually similar but visually different"
                         if distance <= 15
-                        else "Visually distinct — likely a different image"
+                        else "Visually distinct - likely a different image"
                     ),
                 }
         except Exception:
@@ -611,6 +611,21 @@ async def public_verify_file(
     else:
         # SHA-256 mismatch: compute pHash similarity before expensive Gemini forensics
         stored_phash = row.get("phash")
+        if not stored_phash:
+            # Backfill pHash on first verify: fetch original bytes via authenticated B2 SDK.
+            try:
+                import imagehash
+                from PIL import Image
+                import io as _io
+                _orig_bytes = await _read_b2_asset_bytes(row)
+                _orig_pil = Image.open(_io.BytesIO(_orig_bytes))
+                stored_phash = str(imagehash.phash(_orig_pil))
+                await db.execute("UPDATE assets SET phash = ? WHERE run_id = ?", (stored_phash, run_id))
+                await db.commit()
+                logger.info("phash: backfilled stored_phash %s for run %s", stored_phash, run_id)
+            except Exception as _ph_err:
+                logger.warning("phash: backfill via B2 failed for %s (%s)", run_id, _ph_err)
+
         if stored_phash:
             try:
                 import imagehash
@@ -629,11 +644,11 @@ async def public_verify_file(
                     "similarity_pct": round((1 - distance / 64) * 100, 1),
                     "is_perceptual_match": distance <= 4,
                     "verdict": (
-                        "Visually identical — file modified by compression or re-encoding"
+                        "Visually identical - file modified by compression or re-encoding"
                         if distance <= 4
                         else "Perceptually similar but visually different"
                         if distance <= 15
-                        else "Visually distinct — likely a different image"
+                        else "Visually distinct - likely a different image"
                     ),
                 }
             except Exception as exc:
@@ -845,6 +860,7 @@ async def _save_asset_to_db(db, req, res, modality: str | None = None):
             "india_compliant": None,
             "eu_compliant": None,
             "is_distributed": 1 if is_distributed else 0,
+            "phash": record.get("phash"),
         }
 
     source_record = res.get("source_record")
