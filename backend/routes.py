@@ -495,6 +495,31 @@ async def public_verify(
     manifest_hash = manifest_asset.sha256
     is_match = req.file_hash.lower() == manifest_hash.lower()
 
+    # pHash resilient fallback: if SHA-256 fails, check perceptual similarity
+    phash_match = None
+    if not is_match and row.get("phash"):
+        try:
+            from cache import _hamming_distance
+            file_phash = getattr(req, "file_phash", None)
+            if file_phash:
+                distance = _hamming_distance(file_phash, row["phash"])
+                phash_match = {
+                    "stored_phash": row["phash"],
+                    "submitted_phash": file_phash,
+                    "hamming_distance": distance,
+                    "similarity_pct": round((1 - distance / 64) * 100, 1),
+                    "is_perceptual_match": distance <= 4,
+                    "verdict": (
+                        "Visually identical — file modified by compression or re-encoding"
+                        if distance <= 4
+                        else "Perceptually similar but visually different"
+                        if distance <= 15
+                        else "Visually distinct — likely a different image"
+                    ),
+                }
+        except Exception:
+            pass
+
     verified_at = datetime.now(timezone.utc).isoformat()
     return VerifyResponse(
         match=is_match,
@@ -503,7 +528,41 @@ async def public_verify(
         verified_at=verified_at,
         forensic_analysis=None,
         manifest_valid=True,
+        phash_match=phash_match,
     )
+
+
+@router.get("/public/verify/search")
+async def phash_search(
+    phash: str = Query(..., description="Hex-encoded pHash to search for"),
+    max_distance: int = Query(4, ge=0, le=64, description="Maximum Hamming distance"),
+    db: Connection = Depends(get_db),
+):
+    """
+    Search for assets that are perceptually similar to a given pHash.
+    Returns assets within the specified Hamming distance threshold.
+    Useful for finding originals of screenshots, compressed copies, etc.
+    """
+    from cache import find_by_phash
+    results = await find_by_phash(db, phash, max_distance)
+    return {
+        "query_phash": phash,
+        "max_distance": max_distance,
+        "total_matches": len(results),
+        "matches": [
+            {
+                "run_id": r["run_id"],
+                "provider": r["provider"],
+                "model": r["model"],
+                "prompt": r["prompt"],
+                "sha256": r["sha256"],
+                "phash": r["phash"],
+                "phash_distance": r["phash_distance"],
+                "phash_similarity": r["phash_similarity"],
+            }
+            for r in results
+        ],
+    }
 
 
 @router.post("/public/verify/{run_id}/file", response_model=VerifyResponse)
@@ -543,13 +602,44 @@ async def public_verify_file(
     is_match = computed_hash.lower() == manifest_hash.lower()
     embedded_chain_valid = True
     forensic = None
+    phash_match = None
     if is_match:
         await file.seek(0)
         submitted_bytes = await file.read()
         embedded_chain_valid = verify_embedded_receipt(manifest, submitted_bytes)
         is_match = embedded_chain_valid
     else:
-        # Only on mismatch: re-read file for Gemini Vision forensic analysis.
+        # SHA-256 mismatch: compute pHash similarity before expensive Gemini forensics
+        stored_phash = row.get("phash")
+        if stored_phash:
+            try:
+                import imagehash
+                from PIL import Image
+                import io as _io
+                from cache import _hamming_distance
+                await file.seek(0)
+                uploaded_bytes = await file.read()
+                uploaded_pil = Image.open(_io.BytesIO(uploaded_bytes))
+                uploaded_phash = str(imagehash.phash(uploaded_pil))
+                distance = _hamming_distance(uploaded_phash, stored_phash)
+                phash_match = {
+                    "stored_phash": stored_phash,
+                    "submitted_phash": uploaded_phash,
+                    "hamming_distance": distance,
+                    "similarity_pct": round((1 - distance / 64) * 100, 1),
+                    "is_perceptual_match": distance <= 4,
+                    "verdict": (
+                        "Visually identical — file modified by compression or re-encoding"
+                        if distance <= 4
+                        else "Perceptually similar but visually different"
+                        if distance <= 15
+                        else "Visually distinct — likely a different image"
+                    ),
+                }
+            except Exception as exc:
+                logger.warning("phash: comparison failed in verify (%s)", exc)
+
+        # Re-read file for Gemini Vision forensic analysis.
         await file.seek(0)
         submitted_bytes = await file.read()
         forensic = await _forensic_detail(row, submitted_bytes)
@@ -561,7 +651,9 @@ async def public_verify_file(
         verified_at=datetime.now(timezone.utc).isoformat(),
         forensic_analysis=forensic,
         manifest_valid=embedded_chain_valid,
+        phash_match=phash_match,
     )
+
 
 
 # ── Admin ──────────────────────────────────────────────────

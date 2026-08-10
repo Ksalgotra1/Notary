@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS assets (
     policy_profile TEXT,
     prompt_audit_json TEXT,
     visual_audit_json TEXT,
-    policy_manifest_url TEXT
+    policy_manifest_url TEXT,
+    phash TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_created_at ON assets(created_at DESC);
@@ -54,6 +55,7 @@ async def init_db() -> None:
             ("prompt_audit_json", "TEXT"),
             ("visual_audit_json", "TEXT"),
             ("policy_manifest_url", "TEXT"),
+            ("phash", "TEXT"),
         ):
             try:
                 await db.execute(f"ALTER TABLE assets ADD COLUMN {column} {definition}")
@@ -70,18 +72,22 @@ async def get_db() -> AsyncGenerator[aiosqlite.Connection, None]:
 
 
 async def insert_asset(db: aiosqlite.Connection, asset: dict) -> None:
+    # Ensure phash key exists even if the pipeline didn't set it
+    asset.setdefault("phash", None)
     await db.execute(
         """
         INSERT OR REPLACE INTO assets (
             run_id, parent_run_id, provider, model, modality, prompt,
             b2_asset_url, b2_manifest_url, sha256, created_at,
             has_embedded_metadata, has_visible_label,
-            has_machine_readable_mark, has_audio_disclosure, is_distributed
+            has_machine_readable_mark, has_audio_disclosure, is_distributed,
+            phash
         ) VALUES (
             :run_id, :parent_run_id, :provider, :model, :modality, :prompt,
             :b2_asset_url, :b2_manifest_url, :sha256, :created_at,
             :has_embedded_metadata, :has_visible_label,
-            :has_machine_readable_mark, :has_audio_disclosure, :is_distributed
+            :has_machine_readable_mark, :has_audio_disclosure, :is_distributed,
+            :phash
         )
         """,
         asset,
@@ -274,3 +280,42 @@ async def get_lineage(db: aiosqlite.Connection, run_id: str) -> dict:
         "edges": edges,
         "total_nodes": len(nodes),
     }
+
+
+# ── Perceptual Hash (pHash) Utilities ────────────────────────────
+
+
+def _hamming_distance(hex1: str, hex2: str) -> int:
+    """Compute Hamming distance between two hex-encoded pHash strings."""
+    try:
+        val1 = int(hex1, 16)
+        val2 = int(hex2, 16)
+        return bin(val1 ^ val2).count("1")
+    except (ValueError, TypeError):
+        return 64  # Maximum distance on parse failure
+
+
+async def find_by_phash(
+    db: aiosqlite.Connection,
+    phash_hex: str,
+    max_distance: int = 4,
+) -> list[dict]:
+    """Find assets whose pHash is within Hamming distance of the query."""
+    async with db.execute(
+        "SELECT * FROM assets WHERE phash IS NOT NULL AND is_distributed = 1"
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    results = []
+    for row in rows:
+        row = dict(row)
+        stored_phash = row.get("phash")
+        if stored_phash:
+            distance = _hamming_distance(phash_hex, stored_phash)
+            if distance <= max_distance:
+                row["phash_distance"] = distance
+                row["phash_similarity"] = round((1 - distance / 64) * 100, 1)
+                results.append(row)
+    results.sort(key=lambda r: r["phash_distance"])
+    return results
+

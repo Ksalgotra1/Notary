@@ -133,6 +133,7 @@ class VerifyResponse(BaseModel):
     verified_at: str
     manifest_valid: bool = False
     forensic_analysis: Optional[ForensicDetail] = None  # only when match=False
+    phash_match: Optional[dict] = None  # pHash Hamming distance comparison result
 
 
 # ── USP Feature 3: Public Verification Portal ────────────────────

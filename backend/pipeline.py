@@ -389,6 +389,21 @@ async def _create_embedded_receipt(raw_result, *, provider: str, model: str, rec
     from watermark import apply_watermark
     raw_bytes = apply_watermark(raw_bytes, raw_asset.media_type)
 
+    # Compute 64-bit perceptual hash (pHash) of watermarked image for
+    # compression-resilient verification.  Survives JPEG re-encoding,
+    # screenshots, and minor crops.
+    phash_hex = None
+    try:
+        import imagehash
+        from PIL import Image
+        import io as _io
+        pil_image = Image.open(_io.BytesIO(raw_bytes))
+        phash_value = imagehash.phash(pil_image)
+        phash_hex = str(phash_value)
+        logger.info("phash: computed perceptual hash %s for run %s", phash_hex, receipt_run_id)
+    except Exception as phash_exc:
+        logger.warning("phash: computation failed for %s (%s) — continuing without pHash", receipt_run_id, phash_exc)
+
     with tempfile.TemporaryDirectory(prefix="notary-embed-") as directory:
         path = Path(directory) / f"embedded{suffix}"
         path.write_bytes(raw_bytes)
@@ -470,6 +485,7 @@ async def _create_embedded_receipt(raw_result, *, provider: str, model: str, rec
     receipt_result = PipelineResult(receipt_run, receipt_manifest)
     receipt_record = _pipeline_result_record(receipt_result, provider=provider, model=model, embedded=True)
     receipt_record["has_c2pa"] = has_c2pa
+    receipt_record["phash"] = phash_hex
     # M0 is retained as an internal lineage node; M1 is the shareable artifact.
     receipt_record["source_record"] = _pipeline_result_record(
         raw_result, provider=provider, model=model, embedded=False,
