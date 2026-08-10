@@ -24,8 +24,8 @@ export default function Sidebar() {
     });
   };
 
-  // Hide main app sidebar on public verification portal route
-  if (location.pathname.startsWith('/verify/')) {
+  // Hide main app sidebar on public verification portal, landing page, and docs page
+  if (location.pathname.startsWith('/verify/') || location.pathname === '/' || location.pathname === '/docs') {
     return null;
   }
 
@@ -33,7 +33,7 @@ export default function Sidebar() {
     <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
       {/* Header & Collapse Toggle */}
       <div className="sidebar-header">
-        <NavLink to="/" className="sidebar-brand" title="Notary">
+        <NavLink to="/app" className="sidebar-brand" title="Notary">
           <div className="sidebar-brand-icon">
             <Shield style={{ width: 20, height: 20, strokeWidth: 2.2 }} />
           </div>
@@ -68,7 +68,7 @@ export default function Sidebar() {
         </NavLink>
 
         <NavLink
-          to="/"
+          to="/app"
           className={({ isActive }) =>
             `sidebar-link ${isActive ? 'active' : ''}`
           }
