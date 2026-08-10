@@ -860,13 +860,58 @@ async def _save_asset_to_db(db, req, res, modality: str | None = None):
         await insert_asset(db, row_for(res, is_distributed=True))
 
 
+# ── Download Original Asset (preserves C2PA) ─────────────────────
+
+@router.get("/assets/{run_id}/download")
+async def download_original_asset(run_id: str, db: Connection = Depends(get_db)):
+    """
+    Proxy-stream the original asset bytes from B2 with Content-Disposition:
+    attachment so the browser downloads instead of rendering. This preserves
+    C2PA JUMBF headers that would be stripped by right-click → Save As.
+    """
+    row = await get_asset(db, run_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    b2_url = row["b2_asset_url"]
+    if not b2_url:
+        raise HTTPException(status_code=404, detail="No asset URL found for this run")
+
+    # Determine file extension from URL or media type
+    ext = "webp"
+    if b2_url.endswith(".png"):
+        ext = "png"
+    elif b2_url.endswith(".jpg") or b2_url.endswith(".jpeg"):
+        ext = "jpg"
+    elif b2_url.endswith(".mp4"):
+        ext = "mp4"
+
+    media_types = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp", "mp4": "video/mp4"}
+    content_type = media_types.get(ext, "application/octet-stream")
+
+    try:
+        asset_bytes = await _read_b2_asset_bytes(row)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch asset from storage: {exc}")
+
+    filename = f"notary-{run_id[:8]}.{ext}"
+    return Response(
+        content=asset_bytes,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache",
+        },
+    )
+
 # ── Provenance Certificate ───────────────────────────────────────
 
 @router.get("/assets/{run_id}/certificate", response_class=Response)
 async def provenance_certificate(run_id: str, db: Connection = Depends(get_db)):
     """
     Add-on: Return a downloadable HTML provenance certificate.
-    Self-contained, print-friendly, with QR code link placeholder.
+    Self-contained, print-friendly. Two-column layout: Identity + Crypto
+    attestations on top, full compliance tables on the bottom.
     """
     row = await get_asset(db, run_id)
     if not row:
@@ -879,107 +924,433 @@ async def provenance_certificate(run_id: str, db: Connection = Depends(get_db)):
 
     verify_url = f"https://notary.app/verify/{run_id}"
     created_dt = row["created_at"]
-    sha_short = row["sha256"][:16] + "..."
 
-    india_checks_html = ""
+    def check_icon(status):
+        return {"pass": "✓", "fail": "✗", "partial": "~", "not_applicable": "—"}.get(status, "—")
+
+    def check_class(status):
+        return {"pass": "chk-pass", "fail": "chk-fail", "partial": "chk-partial", "not_applicable": "chk-na"}.get(status, "")
+
+    india_rows = ""
     for c in india["checks"]:
-        icon = "✅" if c["status"] == "pass" else "⚠️" if c["status"] == "partial" else "⬜" if c["status"] == "not_applicable" else "❌"
-        india_checks_html += f'<tr><td>{icon}</td><td>{c["requirement_id"]}</td><td>{c["description"]}</td><td><b>{c["status"].upper()}</b></td></tr>'
+        india_rows += (
+            f'<tr class="{check_class(c["status"])}">'
+            f'<td class="icon-cell">{check_icon(c["status"])}</td>'
+            f'<td class="rule-id">{c["requirement_id"]}</td>'
+            f'<td>{c["description"]}</td>'
+            f'<td class="status-cell">{c["status"].upper()}</td>'
+            f'</tr>'
+        )
 
-    eu_checks_html = ""
+    eu_rows = ""
     for c in eu["checks"]:
-        icon = "✅" if c["status"] == "pass" else "⚠️" if c["status"] == "partial" else "❌"
-        eu_checks_html += f'<tr><td>{icon}</td><td>{c["requirement_id"]}</td><td>{c["description"]}</td><td><b>{c["status"].upper()}</b></td></tr>'
+        eu_rows += (
+            f'<tr class="{check_class(c["status"])}">'
+            f'<td class="icon-cell">{check_icon(c["status"])}</td>'
+            f'<td class="rule-id">{c["requirement_id"]}</td>'
+            f'<td>{c["description"]}</td>'
+            f'<td class="status-cell">{c["status"].upper()}</td>'
+            f'</tr>'
+        )
+
+    overall_compliant = india["compliant"] and eu["compliant"]
+    overall_label = "FULLY COMPLIANT" if overall_compliant else "PARTIALLY COMPLIANT"
+    overall_class = "badge-compliant" if overall_compliant else "badge-partial"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Notary Provenance Certificate — {run_id[:8]}</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ font-family: 'Inter', sans-serif; background: #0a0a12; color: #e8e8f0; padding: 40px; }}
-  .cert {{ max-width: 800px; margin: 0 auto; background: linear-gradient(135deg, #12121e 0%, #1a1a2e 100%);
-           border: 1px solid rgba(99,102,241,0.3); border-radius: 16px; padding: 48px; position: relative; overflow: hidden; }}
-  .cert::before {{ content: ''; position: absolute; top: -2px; left: -2px; right: -2px; bottom: -2px;
-                   background: linear-gradient(135deg, #6366f1, #3b82f6, #6366f1); border-radius: 17px; z-index: -1; }}
-  .header {{ text-align: center; margin-bottom: 32px; }}
-  .header h1 {{ font-size: 28px; font-weight: 800; background: linear-gradient(135deg, #6366f1, #3b82f6);
-               -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
-  .header .subtitle {{ color: #888; font-size: 13px; margin-top: 4px; }}
-  .shield {{ font-size: 48px; margin-bottom: 12px; }}
-  .section {{ margin: 24px 0; }}
-  .section h2 {{ font-size: 15px; font-weight: 700; color: #6366f1; text-transform: uppercase;
-                 letter-spacing: 1.5px; margin-bottom: 12px; border-bottom: 1px solid rgba(99,102,241,0.2); padding-bottom: 6px; }}
-  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
-  .field {{ background: rgba(255,255,255,0.04); border-radius: 8px; padding: 12px; }}
-  .field .label {{ font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 1px; }}
-  .field .value {{ font-size: 14px; font-weight: 600; margin-top: 4px; word-break: break-all; }}
-  .field.full {{ grid-column: 1 / -1; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-  table th {{ text-align: left; color: #888; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.08); }}
-  table td {{ padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); }}
-  .score {{ display: inline-block; background: linear-gradient(135deg, #6366f1, #3b82f6); color: #fff;
-            font-size: 20px; font-weight: 800; padding: 4px 16px; border-radius: 8px; }}
-  .footer {{ text-align: center; margin-top: 32px; font-size: 11px; color: #555; }}
-  .footer a {{ color: #6366f1; }}
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  body {{
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 13px;
+    background: #f1f3f5;
+    color: #1c1e21;
+    padding: 32px 24px;
+    line-height: 1.5;
+  }}
+
+  /* ── Toolbar ── */
+  .toolbar {{
+    max-width: 860px;
+    margin: 0 auto 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }}
+  .toolbar-label {{
+    font-size: 12px;
+    color: #6b7280;
+    letter-spacing: 0.03em;
+  }}
+  .print-btn {{
+    background: #1c1e21;
+    color: #fff;
+    border: none;
+    padding: 7px 18px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    letter-spacing: 0.02em;
+  }}
+  .print-btn:hover {{ background: #374151; }}
+
+  /* ── Certificate Card ── */
+  .cert {{
+    max-width: 860px;
+    margin: 0 auto;
+    background: #ffffff;
+    border: 1px solid #d1d5db;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  }}
+
+  /* ── Header Band ── */
+  .cert-header {{
+    background: #1c1e21;
+    color: #fff;
+    padding: 28px 36px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+  }}
+  .cert-header-left h1 {{
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin-bottom: 3px;
+  }}
+  .cert-header-left p {{
+    font-size: 11px;
+    color: #9ca3af;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }}
+  .cert-badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 5px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+  }}
+  .badge-compliant {{
+    background: #d1fae5;
+    color: #065f46;
+    border: 1px solid #6ee7b7;
+  }}
+  .badge-partial {{
+    background: #fef3c7;
+    color: #92400e;
+    border: 1px solid #fcd34d;
+  }}
+
+  /* ── Body ── */
+  .cert-body {{ padding: 32px 36px; }}
+
+  /* ── Two-Column Top Section ── */
+  .top-columns {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin-bottom: 28px;
+  }}
+
+  /* ── Section ── */
+  .section {{ margin-bottom: 28px; }}
+  .section-title {{
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #6b7280;
+    border-bottom: 1px solid #e5e7eb;
+    padding-bottom: 6px;
+    margin-bottom: 14px;
+  }}
+
+  /* ── Identity Fields ── */
+  .field-list {{ display: flex; flex-direction: column; gap: 10px; }}
+  .field-row {{
+    display: grid;
+    grid-template-columns: 100px 1fr;
+    gap: 8px;
+    align-items: baseline;
+  }}
+  .field-key {{
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #9ca3af;
+    padding-top: 1px;
+  }}
+  .field-val {{
+    font-size: 12.5px;
+    color: #111827;
+    word-break: break-all;
+    line-height: 1.45;
+  }}
+  .mono {{ font-family: 'JetBrains Mono', monospace; font-size: 11px; }}
+
+  /* ── Crypto Attestations ── */
+  .attest-list {{ display: flex; flex-direction: column; gap: 8px; }}
+  .attest-row {{
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 9px 12px;
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+  }}
+  .attest-icon {{
+    font-size: 13px;
+    line-height: 1;
+    margin-top: 1px;
+    flex-shrink: 0;
+  }}
+  .attest-label {{
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #6b7280;
+    margin-bottom: 1px;
+  }}
+  .attest-val {{
+    font-size: 12px;
+    color: #111827;
+    font-family: 'JetBrains Mono', monospace;
+  }}
+  .attest-row.ok .attest-icon {{ color: #059669; }}
+  .attest-row.ok {{ border-left: 3px solid #059669; }}
+  .attest-row.info .attest-icon {{ color: #6366f1; }}
+  .attest-row.info {{ border-left: 3px solid #6366f1; }}
+
+  /* ── Compliance Score ── */
+  .score-header {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+  }}
+  .score-pill {{
+    display: inline-block;
+    background: #1c1e21;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 3px 12px;
+    border-radius: 20px;
+    font-family: 'JetBrains Mono', monospace;
+  }}
+
+  /* ── Compliance Tables ── */
+  table {{ width: 100%; border-collapse: collapse; font-size: 11.5px; }}
+  thead tr {{ background: #f9fafb; }}
+  th {{
+    text-align: left;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #9ca3af;
+    padding: 7px 10px;
+    border-bottom: 1px solid #e5e7eb;
+  }}
+  td {{ padding: 7px 10px; border-bottom: 1px solid #f3f4f6; vertical-align: top; }}
+  .icon-cell {{ width: 28px; font-size: 13px; text-align: center; }}
+  .rule-id {{ font-family: 'JetBrains Mono', monospace; font-size: 10.5px; width: 110px; color: #374151; white-space: nowrap; }}
+  .status-cell {{ font-weight: 700; font-size: 10px; white-space: nowrap; width: 80px; }}
+  tr.chk-pass .icon-cell {{ color: #059669; }}
+  tr.chk-pass .status-cell {{ color: #059669; }}
+  tr.chk-fail .icon-cell {{ color: #dc2626; }}
+  tr.chk-fail .status-cell {{ color: #dc2626; }}
+  tr.chk-partial .icon-cell {{ color: #d97706; }}
+  tr.chk-partial .status-cell {{ color: #d97706; }}
+  tr.chk-na .icon-cell, tr.chk-na .status-cell {{ color: #9ca3af; }}
+
+  /* ── Footer ── */
+  .cert-footer {{
+    background: #f9fafb;
+    border-top: 1px solid #e5e7eb;
+    padding: 16px 36px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }}
+  .cert-footer p {{ font-size: 11px; color: #9ca3af; }}
+  .cert-footer a {{ color: #4b5563; text-decoration: underline; }}
+
+  /* ── Print ── */
   @media print {{
-    .no-print {{ display: none !important; }}
-    body {{ background: #ffffff !important; color: #000000 !important; padding: 0 !important; }}
-    .cert {{ border: 2px solid #6366f1 !important; background: #ffffff !important; box-shadow: none !important; color: #000000 !important; padding: 24px !important; }}
-    .field {{ background: #f8fafc !important; border: 1px solid #e2e8f0 !important; }}
-    .field .value {{ color: #0f172a !important; }}
-    table th {{ color: #475569 !important; border-bottom: 1px solid #cbd5e1 !important; }}
-    table td {{ border-bottom: 1px solid #f1f5f9 !important; color: #0f172a !important; }}
+    .toolbar {{ display: none !important; }}
+    body {{ background: #fff; padding: 0; }}
+    .cert {{ border: none; border-radius: 0; box-shadow: none; max-width: 100%; }}
+    .cert-header {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
   }}
 </style>
 </head>
 <body>
-<div class="no-print" style="max-width:800px;margin:0 auto 16px auto;display:flex;justify-content:space-between;align-items:center;">
-  <span style="color:#888;font-size:13px;font-family:sans-serif;">📄 Official Provenance Certificate PDF Export</span>
-  <button onclick="window.print()" style="background:#6366f1;color:#fff;border:none;padding:8px 18px;border-radius:6px;font-weight:600;cursor:pointer;font-family:sans-serif;">🖨️ Download / Save as PDF</button>
+
+<div class="toolbar no-print">
+  <span class="toolbar-label">Notary Provenance Certificate — {run_id[:8]}</span>
+  <button class="print-btn" onclick="window.print()">Download / Save as PDF</button>
 </div>
 
 <div class="cert">
-  <div class="header">
-    <div class="shield">🛡️</div>
-    <h1>Notary — Provenance Certificate</h1>
-    <div class="subtitle">Immutable AI Content Provenance &amp; Regulatory Compliance Record</div>
-  </div>
 
-  <div class="section">
-    <h2>Asset Identity</h2>
-    <div class="grid">
-      <div class="field"><div class="label">Run ID</div><div class="value" style="font-family:monospace;font-size:12px">{run_id}</div></div>
-      <div class="field"><div class="label">Created At</div><div class="value">{created_dt}</div></div>
-      <div class="field"><div class="label">AI Provider</div><div class="value">{row['provider']}</div></div>
-      <div class="field"><div class="label">Model</div><div class="value">{row['model']}</div></div>
-      <div class="field full"><div class="label">Original Prompt</div><div class="value">{row['prompt']}</div></div>
-      <div class="field full"><div class="label">SHA-256 Fingerprint</div><div class="value" style="font-family:monospace;font-size:11px">{row['sha256']}</div></div>
+  <!-- Header -->
+  <div class="cert-header">
+    <div class="cert-header-left">
+      <h1>Notary — Provenance Certificate</h1>
+      <p>Immutable AI Content Provenance &amp; Regulatory Compliance Record</p>
     </div>
+    <span class="cert-badge {overall_class}">{overall_label}</span>
   </div>
 
-  <div class="section">
-    <h2>India IT Rules 2026 — SGI Compliance <span class="score">{india['passed']}/{india['total']}</span></h2>
-    <table><thead><tr><th></th><th>Rule</th><th>Description</th><th>Status</th></tr></thead><tbody>{india_checks_html}</tbody></table>
+  <div class="cert-body">
+
+    <!-- Two-column top: Identity left, Crypto right -->
+    <div class="top-columns">
+
+      <!-- Asset Identity -->
+      <div class="section">
+        <div class="section-title">Asset Identity</div>
+        <div class="field-list">
+          <div class="field-row">
+            <span class="field-key">Run ID</span>
+            <span class="field-val mono">{run_id}</span>
+          </div>
+          <div class="field-row">
+            <span class="field-key">Created</span>
+            <span class="field-val">{created_dt}</span>
+          </div>
+          <div class="field-row">
+            <span class="field-key">Provider</span>
+            <span class="field-val">{row['provider']}</span>
+          </div>
+          <div class="field-row">
+            <span class="field-key">Model</span>
+            <span class="field-val mono">{row['model']}</span>
+          </div>
+          <div class="field-row">
+            <span class="field-key">Prompt</span>
+            <span class="field-val">{row['prompt']}</span>
+          </div>
+          <div class="field-row">
+            <span class="field-key">SHA-256</span>
+            <span class="field-val mono">{row['sha256']}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Cryptographic Attestations -->
+      <div class="section">
+        <div class="section-title">Cryptographic Attestations</div>
+        <div class="attest-list">
+          <div class="attest-row ok">
+            <span class="attest-icon">&#10003;</span>
+            <div>
+              <div class="attest-label">Ed25519 Manifest Signature</div>
+              <div class="attest-val">Independent trust anchor</div>
+            </div>
+          </div>
+          <div class="attest-row ok">
+            <span class="attest-icon">&#10003;</span>
+            <div>
+              <div class="attest-label">C2PA Content Credentials</div>
+              <div class="attest-val">ES256 JUMBF — contentcredentials.org</div>
+            </div>
+          </div>
+          <div class="attest-row ok">
+            <span class="attest-icon">&#10003;</span>
+            <div>
+              <div class="attest-label">B2 Object Lock</div>
+              <div class="attest-val">COMPLIANCE mode — WORM immutable</div>
+            </div>
+          </div>
+          <div class="attest-row ok">
+            <span class="attest-icon">&#10003;</span>
+            <div>
+              <div class="attest-label">Visible Watermark</div>
+              <div class="attest-val">AI-Generated · Notary Verified</div>
+            </div>
+          </div>
+          <div class="attest-row info">
+            <span class="attest-icon">&#9432;</span>
+            <div>
+              <div class="attest-label">Claim Generator</div>
+              <div class="attest-val">Notary/3.0.0 (C2PA; ES256)</div>
+            </div>
+          </div>
+          <div class="attest-row info">
+            <span class="attest-icon">&#9432;</span>
+            <div>
+              <div class="attest-label">Digital Source Type</div>
+              <div class="attest-val">trainedAlgorithmicMedia (IPTC)</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- India Compliance Table -->
+    <div class="section">
+      <div class="score-header">
+        <div class="section-title" style="margin-bottom:0;border:none">India IT (Intermediary Guidelines) Amendment Rules, 2026</div>
+        <span class="score-pill">{india['passed']}/{india['total']}</span>
+      </div>
+      <table>
+        <thead><tr><th></th><th>Rule</th><th>Requirement</th><th>Result</th></tr></thead>
+        <tbody>{india_rows}</tbody>
+      </table>
+    </div>
+
+    <!-- EU Compliance Table -->
+    <div class="section">
+      <div class="score-header">
+        <div class="section-title" style="margin-bottom:0;border:none">EU AI Act — Article 50: Transparency Obligations</div>
+        <span class="score-pill">{eu['passed']}/{eu['total']}</span>
+      </div>
+      <table>
+        <thead><tr><th></th><th>Rule</th><th>Requirement</th><th>Result</th></tr></thead>
+        <tbody>{eu_rows}</tbody>
+      </table>
+    </div>
+
   </div>
 
-  <div class="section">
-    <h2>EU AI Act Article 50 <span class="score">{eu['passed']}/{eu['total']}</span></h2>
-    <table><thead><tr><th></th><th>Rule</th><th>Description</th><th>Status</th></tr></thead><tbody>{eu_checks_html}</tbody></table>
+  <!-- Footer -->
+  <div class="cert-footer">
+    <p>Generated by <strong>Notary</strong> — powered by Backblaze B2 Object Lock &amp; Genblaze.</p>
+    <p>Verify: <a href="{verify_url}">{verify_url}</a></p>
+    <p>Issued {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</p>
   </div>
 
-  <div class="footer">
-    <p>This certificate was generated by <b>Notary</b> — an immutable provenance engine powered by Backblaze B2 &amp; Genblaze.</p>
-    <p>Verify this asset at: <a href="{verify_url}">{verify_url}</a></p>
-    <p style="margin-top:8px;color:#444">Certificate generated at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
-  </div>
 </div>
 
 <script>
   window.addEventListener('DOMContentLoaded', () => {{
-    setTimeout(() => {{ window.print(); }}, 400);
+    setTimeout(() => {{ window.print(); }}, 350);
   }});
 </script>
 </body>

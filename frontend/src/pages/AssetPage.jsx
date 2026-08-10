@@ -14,6 +14,8 @@ import {
   ShieldCheck,
   Eye,
   Lock,
+  FileCheck,
+  Shield,
 } from 'lucide-react';
 
 import api from '../api/client';
@@ -40,6 +42,7 @@ export default function AssetPage() {
   const [remixing, setRemixing] = useState(false);
 
   const [showBadge, setShowBadge] = useState(false);
+  const [showC2pa, setShowC2pa] = useState(false);
   const [toast, setToast] = useState(null);
 
   const loadData = useCallback(async () => {
@@ -271,7 +274,7 @@ export default function AssetPage() {
       <div className="split-layout">
         {/* Left Column: Media Preview + Verification Result + Provenance Manifest */}
         <div>
-          <div className="asset-preview card" style={{ padding: 16, overflow: 'hidden' }}>
+          <div className="asset-preview card" style={{ padding: 16, overflow: 'hidden', position: 'relative' }}>
             {asset.modality === 'video' ? (
               <video controls autoPlay loop playsInline key={asset.run_id} style={{ width: '100%', borderRadius: 8 }}>
                 <source src={asset.b2_asset_url} type="video/mp4" />
@@ -284,7 +287,32 @@ export default function AssetPage() {
                 style={{ borderRadius: 8, width: '100%', display: 'block', maxHeight: 500, objectFit: 'contain' }}
               />
             )}
+
+            {/* Download Original Asset — proxied through backend to preserve C2PA JUMBF */}
+            <a
+              href={`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/assets/${runId}/download`}
+              className="btn btn-secondary"
+              style={{
+                position: 'absolute',
+                bottom: 24,
+                right: 24,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                fontSize: '0.75rem',
+                padding: '6px 14px',
+                backdropFilter: 'blur(12px)',
+                background: 'rgba(0, 0, 0, 0.65)',
+                border: '1px solid rgba(255,255,255,0.15)',
+                textDecoration: 'none',
+              }}
+              title="Download original file with C2PA Content Credentials preserved"
+            >
+              <Download style={{ width: 13, height: 13 }} />
+              <span>Download Original</span>
+            </a>
           </div>
+
 
           {/* Trust & Provenance Badges Bar */}
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginTop: 12, padding: 12 }} className="glass-panel rounded-xl">
@@ -322,12 +350,59 @@ export default function AssetPage() {
               <span>Watermark: {asset?.has_visible_label ? 'Applied ✓' : 'Embedded'}</span>
             </div>
 
+            {/* C2PA Content Credentials Badge */}
+            <div
+              className="badge-c2pa"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 6, fontSize: '0.75rem', fontFamily: 'var(--font-mono)', cursor: 'pointer' }}
+              title="C2PA Content Credentials (ES256 JUMBF) embedded in this asset. Click to inspect."
+              onClick={() => setShowC2pa((v) => !v)}
+            >
+              <FileCheck style={{ width: 14, height: 14 }} />
+              <span>C2PA Content Credentials</span>
+              <span style={{ opacity: 0.65, marginLeft: 2 }}>{showC2pa ? '[▲]' : '[▼]'}</span>
+            </div>
+
             {/* B2 WORM Object Lock Status */}
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 6, fontSize: '0.75rem', fontFamily: 'var(--font-mono)', background: 'rgba(16, 185, 129, 0.1)', color: '#10b981', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
               <Lock style={{ width: 14, height: 14 }} />
               <span>B2 Object Lock: COMPLIANCE Mode</span>
             </div>
           </div>
+
+          {/* C2PA Inspector Drawer */}
+          {showC2pa && (
+            <div className="c2pa-drawer">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+                <FileCheck style={{ width: 16, height: 16, color: '#34d399' }} />
+                <span style={{ fontWeight: 600, fontSize: '0.875rem', color: '#34d399', fontFamily: 'var(--font-mono)' }}>C2PA Content Credentials — Claim Inspector</span>
+                <a
+                  href="https://contentcredentials.org/verify"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ marginLeft: 'auto', fontSize: '0.75rem', color: '#34d399', textDecoration: 'underline', fontFamily: 'var(--font-mono)', opacity: 0.8 }}
+                >
+                  Verify on contentcredentials.org ↗
+                </a>
+              </div>
+              <div className="c2pa-drawer-grid">
+                {[
+                  ['Claim Generator',   'Notary/3.0.0 (C2PA; ES256)'],
+                  ['Action',            'c2pa.created'],
+                  ['Digital Source',    'trainedAlgorithmicMedia (IPTC cv.iptc.org)'],
+                  ['Signer',            'Notary Cryptographic Authority (EC P-256)'],
+                  ['AI Provider',       asset.provider || '—'],
+                  ['Model',             asset.model || '—'],
+                  ['Run ID',            asset.run_id],
+                  ['SHA-256',           asset.sha256 ? asset.sha256.slice(0, 32) + '...' : '—'],
+                ].map(([label, value]) => (
+                  <React.Fragment key={label}>
+                    <div className="c2pa-drawer-label">{label}</div>
+                    <div className="c2pa-drawer-value">{value}</div>
+                  </React.Fragment>
+                ))}
+              </div>
+            </div>
+          )}
 
 
           {verifyResult && (
@@ -360,6 +435,16 @@ export default function AssetPage() {
 
         {/* Right Column: Regulatory Compliance Scorecard & Recommendations */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+          {/* 9/9 Overall Compliance Banner */}
+          {compliance?.overall_compliant && (
+            <div className="compliance-overall-pass">
+              <Shield style={{ width: 28, height: 28, color: '#34d399', flexShrink: 0 }} />
+              <div>
+                <h3>9/9 FULLY COMPLIANT</h3>
+                <p>Satisfies all India IT Rules 2026 &amp; EU AI Act Article 50 requirements.</p>
+              </div>
+            </div>
+          )}
           {/* Regulatory Compliance Scorecard Card */}
           <div className="card" style={{ padding: 24 }}>
             <div

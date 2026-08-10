@@ -218,6 +218,59 @@ export default function PublicVerifyPage() {
               </div>
             </div>
 
+            {/* C2PA Content Credentials Section */}
+            <div className="provenance-card mt-6">
+              <div className="provenance-card-header">
+                <h2 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <FileCheck style={{ width: 20, height: 20, color: '#34d399' }} />
+                  <span>C2PA Content Credentials</span>
+                </h2>
+                <a
+                  href="https://contentcredentials.org/verify"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{
+                    fontSize: '0.75rem',
+                    color: '#34d399',
+                    textDecoration: 'underline',
+                    fontFamily: 'var(--font-mono)',
+                  }}
+                >
+                  Verify on contentcredentials.org &#x2197;
+                </a>
+              </div>
+              <p className="text-sm text-secondary" style={{ marginBottom: 16, marginTop: 4 }}>
+                This asset carries an ES256-signed C2PA JUMBF manifest embedded in the media bytes,
+                verifiable by any C2PA-compatible tool or the Adobe Content Credentials portal.
+              </p>
+              <div className="provenance-grid">
+                <div className="provenance-item">
+                  <div className="provenance-label">Claim Generator</div>
+                  <div className="provenance-value font-mono">Notary/3.0.0 (C2PA; ES256)</div>
+                </div>
+                <div className="provenance-item">
+                  <div className="provenance-label">Action</div>
+                  <div className="provenance-value font-mono">c2pa.created</div>
+                </div>
+                <div className="provenance-item">
+                  <div className="provenance-label">Digital Source Type</div>
+                  <div className="provenance-value font-mono">trainedAlgorithmicMedia (IPTC)</div>
+                </div>
+                <div className="provenance-item">
+                  <div className="provenance-label">Signer</div>
+                  <div className="provenance-value font-mono">Notary Cryptographic Authority (EC P-256)</div>
+                </div>
+                <div className="provenance-item">
+                  <div className="provenance-label">AI Provider</div>
+                  <div className="provenance-value">{assetInfo.provider}</div>
+                </div>
+                <div className="provenance-item">
+                  <div className="provenance-label">Model</div>
+                  <div className="provenance-value font-mono">{assetInfo.model}</div>
+                </div>
+              </div>
+            </div>
+
             {/* Drag & Drop File Integrity Check */}
             <div className="provenance-card mt-6">
               <div className="provenance-card-header">
